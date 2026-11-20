@@ -21,8 +21,11 @@ mkdir -p "$c/MacOS" "$res/lib/gdk-pixbuf/loaders" "$res/lib/gio/modules" "$res/s
 
 cp target/release/pawkey "$c/MacOS/pawkey-bin"
 cp "$brew/bin/gdk-pixbuf-query-loaders" "$c/MacOS/"
-find "$brew/lib/gdk-pixbuf-2.0" "$(brew --prefix librsvg)/lib/gdk-pixbuf-2.0" -name '*.so' -path '*loaders*' -exec cp {} "$res/lib/gdk-pixbuf/loaders/" \;
+find "$brew/lib/gdk-pixbuf-2.0" "$(brew --prefix librsvg)/lib/gdk-pixbuf-2.0" -name '*.so' -path '*loaders*' -exec cp -f {} "$res/lib/gdk-pixbuf/loaders/" \;
 cp "$(brew --prefix glib-networking)"/lib/gio/modules/*.so "$res/lib/gio/modules/"
+# Homebrew's files are read-only; these copies get their library paths
+# rewritten below.
+chmod -R u+w "$c"
 cp -r "$brew/share/glib-2.0/schemas" "$res/share/glib-2.0/"
 glib-compile-schemas "$res/share/glib-2.0/schemas"
 cp -r "$(brew --prefix adwaita-icon-theme)/share/icons/Adwaita" "$res/share/icons/"
@@ -53,7 +56,7 @@ for f in "$res"/lib/gdk-pixbuf/loaders/*.so "$res"/lib/gio/modules/*.so; do set 
 # answering "quit" makes it fail instead of waiting forever.
 set -- "$@" -s "$brew/lib"
 for d in "$brew"/opt/*/lib; do set -- "$@" -s "$d"; done
-yes quit | dylibbundler -of -b "$@" -d "$res/libs" -p @executable_path/../Resources/libs/
+yes quit | dylibbundler -of -b -cd "$@" -d "$res/libs" -p @executable_path/../Resources/libs/
 
 # The icon.
 set_dir=$(mktemp -d)/pawkey.iconset
