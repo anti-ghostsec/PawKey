@@ -48,7 +48,12 @@ chmod +x "$c/MacOS/PawKey"
 # Every Homebrew library they need, copied in and pointed at.
 set -- -x "$c/MacOS/pawkey-bin" -x "$c/MacOS/gdk-pixbuf-query-loaders"
 for f in "$res"/lib/gdk-pixbuf/loaders/*.so "$res"/lib/gio/modules/*.so; do set -- "$@" -x "$f"; done
-dylibbundler -of -b "$@" -d "$res/libs" -p @executable_path/../Resources/libs/
+# Libraries named by @rpath are looked for in Homebrew's folders. If one
+# still can't be found, dylibbundler asks for its folder on the terminal;
+# answering "quit" makes it fail instead of waiting forever.
+set -- "$@" -s "$brew/lib"
+for d in "$brew"/opt/*/lib; do set -- "$@" -s "$d"; done
+yes quit | dylibbundler -of -b "$@" -d "$res/libs" -p @executable_path/../Resources/libs/
 
 # The icon.
 set_dir=$(mktemp -d)/pawkey.iconset
