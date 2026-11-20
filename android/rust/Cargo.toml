@@ -1,0 +1,39 @@
+[package]
+name = "pawkey-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "pawkey-core for PawKey on Android: bindings for Kotlin (UniFFI)"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "pawkey_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+pawkey-core = { path = "../../crates/core" }
+uniffi = { version = "0.32.2", features = ["cli"] }
+serde_json = "1"
+zeroize = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Symbols stay: the bindings are generated from the library's own metadata.
+strip = "debuginfo"
+opt-level = "s"
+
+# Argon2id at 192 MiB is far too slow unoptimised.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

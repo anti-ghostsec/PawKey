@@ -1,0 +1,13 @@
+[package]
+name = "pawkey"
+description = "PawKey: two-factor codes for Linux, kept in an encrypted vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pawkey-core.workspace = true
+zeroize.workspace = true
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+soup = { version = "0.9", package = "soup3" }
+serde_json = "1"

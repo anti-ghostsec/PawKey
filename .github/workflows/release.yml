@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # Signed build provenance (see "Attest" below).
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Each platform builds on its own runner and hands its file to "publish",
+# which attests and releases them together. Actions are pinned by commit:
+# a tag can be moved to point at other code.
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The release says which version it is: the tag and Cargo.toml agree.
+      - name: Check the version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$want" = "$have" ] || { echo "the tag is $GITHUB_REF_NAME but Cargo.toml says $have" >&2; exit 1; }
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libsoup-3.0-dev
+      - name: Test
+        run: cargo test --workspace --locked --release
+      - name: Build
+        run: cargo build --release --locked -p pawkey
+      # Needs GTK 4.12 and libsoup 3 on the computer (Debian 13, Ubuntu 24.04 and newer have them).
+      - name: Package
+        run: |
+          name="pawkey-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$name/icons"
+          cp target/release/pawkey install.sh README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cp icons/pawkey.svg "dist/$name/icons/"
+          tar -C dist --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # GTK 4, libsoup and Rust from MSYS2 (UCRT64), so they all agree.
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libsoup3
+            mingw-w64-ucrt-x86_64-glib-networking
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+      - name: Test
+        run: cargo test -p pawkey-core --locked --release
+      - name: Build
+        run: cargo build --release --locked -p pawkey
+      - name: Package
+        run: packaging/windows.sh "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: dist/*.zip
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - run: brew install gtk4 libsoup glib-networking librsvg adwaita-icon-theme dylibbundler pkgconf
+      - name: Test
+        run: cargo test -p pawkey-core --locked --release
+      - name: Build
+        run: cargo build --release --locked -p pawkey
+      - name: Package
+        run: packaging/macos.sh "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: dist/*.zip
+
+  # Phones run pawkey-VERSION-android-arm64.apk; the x86_64 one is for the
+  # Android emulator. Signed with PawKey's Android key (secrets
+  # ANDROID_KEYSTORE, base64, and ANDROID_KEYSTORE_PASSWORD) and checked
+  # against android/release-cert.sha256, so each APK installs over the one
+  # before. Without the key, this job does nothing and the rest still ships.
+  android:
+    needs: version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a, target: aarch64-linux-android, name: android-arm64 }
+          - { abi: x86_64, target: x86_64-linux-android, name: android-x86_64 }
+    env:
+      HAVE_KEY: ${{ secrets.ANDROID_KEYSTORE != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.HAVE_KEY == 'true'
+        with:
+          # The version code counts commits.
+          fetch-depth: 0
+      - name: Build
+        if: env.HAVE_KEY == 'true'
+        run: |
+          set -eu
+          export JAVA_HOME="$JAVA_HOME_21_X64" PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses >/dev/null || true
+          "$sdk" --install "ndk;29.0.14206865" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          rustup target add "${{ matrix.target }}"
+          cargo install cargo-ndk --version 4.1.2 --locked
+          PAWKEY_VERSION_CODE=$(git rev-list --count "$GITHUB_SHA") PAWKEY_VERSION_NAME="${GITHUB_REF_NAME#v}" \
+            android/build-android.sh "${{ matrix.abi }}" release
+      - name: Sign
+        if: env.HAVE_KEY == 'true'
+        env:
+          APK: pawkey-${{ github.ref_name }}-${{ matrix.name }}.apk
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -eu
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE" | base64 -d >"$key"
+          mkdir -p dist
+          PAWKEY_KS_PASS=$(printf '%s' "$ANDROID_KEYSTORE_PASSWORD" | tr -d '\r\n') "$tools/apksigner" sign \
+            --ks "$key" --ks-key-alias pawkey --ks-pass env:PAWKEY_KS_PASS --key-pass env:PAWKEY_KS_PASS \
+            --out "dist/$APK" android/app/build/outputs/apk/release/app-release-unsigned.apk
+          # Signed with PawKey's key, not some other one.
+          got=$("$tools/apksigner" verify --print-certs "dist/$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          [ "$got" = "$(cat android/release-cert.sha256)" ] || { echo "signed with $got, not PawKey's key" >&2; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.HAVE_KEY == 'true'
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.apk
+
+  publish:
+    needs: [linux, windows, macos, android]
+    # Android is optional: the desktops ship without it.
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && for f in *; do sha256sum "$f" >"$f.sha256"; done && ls -la
+      # A signed statement, kept by GitHub (Sigstore), that each file was
+      # built by this workflow from this commit. Check a download with:
+      # gh attestation verify FILE --repo anti-ghostsec/PawKey
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.apk
+      - name: Publish the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: PawKey ${{ github.ref_name }}
+          files: dist/*
+          body: |
+            PawKey: two-factor codes, kept in an encrypted vault, with optional end-to-end encrypted sync.
+
+            - **Linux** (x86_64): unpack `pawkey-${{ github.ref_name }}-linux-x86_64.tar.gz` and run `./install.sh` (for your user only). Needs GTK 4.12+ and libsoup 3.
+            - **Windows** (x86_64): unzip `PawKey-${{ github.ref_name }}-windows-x86_64.zip` anywhere and run `PawKey\pawkey.exe`.
+            - **macOS** (Apple Silicon): unzip `PawKey-${{ github.ref_name }}-macos-arm64.zip`, move PawKey to Applications, then right-click it and choose Open the first time (it isn't notarized by Apple).
+            - **Android**: `pawkey-${{ github.ref_name }}-android-arm64.apk` for phones (when this release has one).
+
+            To check a download was built by this repository's release workflow:
+            `gh attestation verify FILE --repo anti-ghostsec/PawKey`

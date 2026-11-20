@@ -1,0 +1,7 @@
+local.properties
+.gradle/
+build/
+app/build/
+# Built by build-android.sh
+app/src/main/jniLibs/
+app/src/main/java/uniffi/

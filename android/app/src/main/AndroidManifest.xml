@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Only for sync, and only once it's turned on. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Only while scanning a setup QR code. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <application
+        android:label="PawKey"
+        android:icon="@drawable/icon"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/no_backup"
+        android:fullBackupContent="false"
+        android:networkSecurityConfig="@xml/network"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Setup links tapped in a browser or another app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="otpauth" android:host="totp" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned by commit: a tag can be moved to point at other code.
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libsoup-3.0-dev
+      - name: Format
+        run: cargo fmt --all --check
+      # The window tests need a display and skip themselves without one.
+      - name: Test
+        run: cargo test --workspace --locked --release
+      - name: Android core
+        run: cargo test --manifest-path android/rust/Cargo.toml --locked --release

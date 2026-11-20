@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/pawkey"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+pawkey-core = { path = "crates/core" }
+vaultkit = { git = "https://github.com/anti-ghostsec/deniable", tag = "v0.3.0" }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Argon2id at 192 MiB is far too slow unoptimised, even while developing.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
