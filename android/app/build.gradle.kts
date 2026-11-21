@@ -18,7 +18,7 @@ android {
         // Each build must count higher than the one it updates: the release
         // workflow passes the number of commits (-PversionCode=...).
         versionCode = (findProperty("versionCode") as String?)?.toInt() ?: 1
-        versionName = (findProperty("versionName") as String?) ?: "0.1.0"
+        versionName = (findProperty("versionName") as String?) ?: "0.1.1"
         ndk { abiFilters += abi }
     }
 
