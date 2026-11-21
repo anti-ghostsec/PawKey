@@ -110,11 +110,13 @@ impl Transport for Http {
         if r.status == 0 {
             return Err(format!("Can't reach the sync service: {}", r.body));
         }
-        let parsed: Json = serde_json::from_str(&r.body).unwrap_or(Json::Null);
+        let parsed: Result<Json, _> = serde_json::from_str(&r.body);
         if !(200..300).contains(&r.status) {
-            return Err(format!("{} {}", r.status, parsed["message"].as_str().unwrap_or("request failed")));
+            let msg = parsed.ok().and_then(|j| j["message"].as_str().map(str::to_string));
+            return Err(format!("{} {}", r.status, msg.as_deref().unwrap_or("request failed")));
         }
-        Ok(parsed)
+        // A web page instead of JSON (a captive portal, maintenance): an error.
+        parsed.map_err(|_| sync::NOT_SYNC_DATA.to_string())
     }
 }
 

@@ -128,7 +128,7 @@ pub fn connect(t: &dyn Transport, account: &SyncAccount) -> Result<(SyncAccount,
     }
     let key = derive_key(&account);
     let data = t.request("GET", &format!("{}/bookmarks/{}", account.service, account.id), None)?;
-    let blob = data["bookmarks"].as_str().unwrap_or("");
+    let (blob, _) = sync_data(&data)?;
     if !blob.is_empty() {
         decrypt(&key, blob).map_err(|_| "Wrong password for this sync ID.".to_string())?;
     }
@@ -379,6 +379,24 @@ pub struct Outcome {
     pub uploaded: bool,
 }
 
+pub const NOT_SYNC_DATA: &str = "The sync service sent something that isn't sync data (is it down for maintenance?). Nothing was changed.";
+
+/// The encrypted data in a reply from the service (empty when there's none
+/// yet) and its date. Anything else (an error page, say) is an error, never
+/// "no accounts": that would read as every account deleted elsewhere.
+fn sync_data(data: &Json) -> Result<(&str, String), String> {
+    let o = data.as_object().ok_or(NOT_SYNC_DATA)?;
+    if !o.contains_key("bookmarks") && !o.contains_key("lastUpdated") {
+        return Err(NOT_SYNC_DATA.into());
+    }
+    let text = |k: &str| match o.get(k) {
+        None | Some(Json::Null) => Ok(""),
+        Some(Json::String(v)) => Ok(v.as_str()),
+        Some(_) => Err(NOT_SYNC_DATA.to_string()),
+    };
+    Ok((text("bookmarks")?, text("lastUpdated")?.to_string()))
+}
+
 /// Brings the service and `local` together. Blocking: run it off the UI
 /// thread. The caller then merges `outcome.accounts` into what it has now
 /// (with the old base), in case accounts changed while this ran.
@@ -387,15 +405,17 @@ pub fn sync(t: &dyn Transport, state: &SyncState, key: &[u8; 32], local: &[Accou
     let url = format!("{}/bookmarks/{}", account.service, account.id);
     for _ in 0..ATTEMPTS {
         let data = t.request("GET", &url, None)?;
-        let blob = data["bookmarks"].as_str().unwrap_or("");
-        let last_updated = data["lastUpdated"].as_str().unwrap_or("").to_string();
+        let (blob, last_updated) = sync_data(&data)?;
         let tree: Json = if blob.is_empty() {
             json!([])
         } else {
             serde_json::from_str(&decrypt(key, blob)?).map_err(|e| format!("The sync data isn't valid JSON: {e}"))?
         };
         let remote = accounts_in(&tree);
-        let merged = merge(local, &state.base, &remote);
+        // Nothing on the service at all (new, or emptied there): upload
+        // what's here rather than take it as everything deleted.
+        let base: &[String] = if blob.is_empty() { &[] } else { &state.base };
+        let merged = merge(local, base, &remote);
         let base = merged.iter().map(|a| a.uid.clone()).collect();
         if merged == remote {
             return Ok(Outcome { accounts: merged, base, last_updated, uploaded: false });
@@ -404,7 +424,7 @@ pub fn sync(t: &dyn Transport, state: &SyncState, key: &[u8; 32], local: &[Accou
         let body = json!({ "bookmarks": encrypt(key, &text)?, "lastUpdated": last_updated });
         match t.request("PUT", &url, Some(&body)) {
             Ok(res) => {
-                let last_updated = res["lastUpdated"].as_str().unwrap_or("").to_string();
+                let (_, last_updated) = sync_data(&res)?;
                 return Ok(Outcome { accounts: merged, base, last_updated, uploaded: true });
             }
             // Another device saved in between: pull theirs and merge again.
@@ -434,6 +454,8 @@ mod tests {
         clock: RefCell<u64>,
         /// Before the next PUT, another device saves this tree first.
         interfere: RefCell<Option<(String, Json)>>,
+        /// The next GET of the data gets this instead (a maintenance page, say).
+        junk: RefCell<Option<Json>>,
     }
 
     impl FakeService {
@@ -466,6 +488,9 @@ mod tests {
                     Ok(json!({ "id": id }))
                 }
                 ("GET", ["bookmarks", id]) => {
+                    if let Some(j) = self.junk.borrow_mut().take() {
+                        return Ok(j);
+                    }
                     let s = self.syncs.borrow();
                     let (blob, n) = s.get(*id).ok_or("404 no such sync")?;
                     Ok(json!({ "bookmarks": blob, "lastUpdated": Self::stamp(*n) }))
@@ -545,6 +570,43 @@ mod tests {
         let mut wrong = account.clone();
         wrong.password = "nope".into();
         assert!(connect(&t, &wrong).unwrap_err().contains("Wrong password"));
+    }
+
+    #[test]
+    fn junk_from_the_service_deletes_nothing() {
+        let t = FakeService::default();
+        let mut account = create_account(&t, "https://sync.test").unwrap();
+        account.password = "pw".into();
+        let key = derive_key(&account);
+        let mut state = SyncState { account: Some(account.clone()), ..Default::default() };
+        let mut local = vec![acc("GitHub"), acc("Bank")];
+        run(&t, &mut state, &key, &mut local);
+        assert_eq!(state.base.len(), 2);
+
+        // Not sync data: an error, and nothing here changes.
+        for junk in [
+            Json::Null,
+            json!("<html>Down for maintenance</html>"),
+            json!({}),
+            json!({ "message": "maintenance" }),
+            json!({ "bookmarks": 5 }),
+            json!([]),
+        ] {
+            *t.junk.borrow_mut() = Some(junk.clone());
+            let err = sync(&t, &state, &key, &local).err().unwrap_or_else(|| panic!("{junk} was taken as sync data"));
+            assert!(err.contains("isn't sync data"), "{err}");
+        }
+        // Looks like sync data, but there's none: taken as a new, empty
+        // service, so what's here goes up again rather than being deleted.
+        *t.junk.borrow_mut() = Some(json!({ "bookmarks": "", "lastUpdated": "" }));
+        let out = sync(&t, &state, &key, &local).unwrap();
+        assert_eq!(issuers(&out.accounts), ["GitHub", "Bank"]);
+        t.put_raw(&account.id, String::new());
+        run(&t, &mut state, &key, &mut local);
+        assert_eq!(issuers(&local), ["GitHub", "Bank"]);
+        let mut other = Vec::new();
+        run(&t, &mut SyncState { account: Some(account), ..Default::default() }, &key, &mut other);
+        assert_eq!(issuers(&other), ["GitHub", "Bank"], "back on the service");
     }
 
     #[test]

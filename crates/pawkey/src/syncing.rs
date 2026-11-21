@@ -76,11 +76,13 @@ impl Transport for Soup {
         }
         let bytes = self.0.send_and_read(&msg, gio::Cancellable::NONE).map_err(|e| format!("Can't reach the sync service: {e}"))?;
         let status = msg.status().into_glib();
-        let parsed: Json = serde_json::from_slice(&bytes).unwrap_or(Json::Null);
+        let parsed: Result<Json, _> = serde_json::from_slice(&bytes);
         if !(200..300).contains(&status) {
-            return Err(format!("{status} {}", parsed["message"].as_str().unwrap_or("request failed")));
+            let msg = parsed.ok().and_then(|j| j["message"].as_str().map(str::to_string));
+            return Err(format!("{status} {}", msg.as_deref().unwrap_or("request failed")));
         }
-        Ok(parsed)
+        // A web page instead of JSON (a captive portal, maintenance): an error.
+        parsed.map_err(|_| sync::NOT_SYNC_DATA.to_string())
     }
 }
 
