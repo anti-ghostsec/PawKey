@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
@@ -19,6 +20,7 @@ import android.util.Size
 import android.view.Gravity
 import android.view.Surface
 import android.view.TextureView
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -62,6 +64,10 @@ class QrScanner(private val activity: Activity, private val onFound: (List<Strin
         bottom.addView(Button(activity).apply { text = "Cancel"; setOnClickListener { close() } })
         root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         dialog.setContentView(root)
+        // The setup QR code holds the account's secret: no screenshots of it.
+        if (activity.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) {
+            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
         dialog.setOnDismissListener { release() }
         dialog.show()
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {

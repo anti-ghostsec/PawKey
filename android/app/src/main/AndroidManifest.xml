@@ -31,5 +31,7 @@
                 <data android:scheme="otpauth" android:host="totp" />
             </intent-filter>
         </activity>
+        <!-- Clears a copied code from the clipboard, even once PawKey is closed. -->
+        <receiver android:name=".ClipboardClearer" android:exported="false" />
     </application>
 </manifest>

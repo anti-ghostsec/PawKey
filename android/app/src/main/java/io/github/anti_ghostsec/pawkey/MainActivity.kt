@@ -3,9 +3,6 @@ package io.github.anti_ghostsec.pawkey
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ClipData
-import android.content.ClipDescription
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -21,7 +18,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PersistableBundle
 import android.os.SystemClock
 import android.text.Editable
 import android.text.InputType
@@ -30,6 +26,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
@@ -75,7 +72,6 @@ class Palette(dark: Boolean) {
 class MainActivity : Activity() {
     companion object {
         const val AUTO_LOCK_MS = 5 * 60 * 1000L
-        const val CLIPBOARD_CLEAR_MS = 30_000L
         const val SYNC_EVERY_MS = 60_000L
         const val REQ_CAMERA = 1
         const val REQ_PICTURE = 2
@@ -123,11 +119,7 @@ class MainActivity : Activity() {
         setTheme(if (dark) android.R.style.Theme_Material_NoActionBar else android.R.style.Theme_Material_Light_NoActionBar)
         super.onCreate(state)
         p = Palette(dark)
-        // No screenshots or screen recording of the codes, except in debug
-        // builds (so the emulator can be checked).
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        }
+        guard(window)
         @Suppress("DEPRECATION")
         window.statusBarColor = p.bg
         @Suppress("DEPRECATION")
@@ -243,6 +235,16 @@ class MainActivity : Activity() {
         }
         setContentView(v)
     }
+
+    /**
+     * No screenshots or screen recording: each pop-up is a window of its own
+     * and needs it too. Not in debug builds, so the emulator can be checked.
+     */
+    private fun guard(w: Window?) {
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) w?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    private fun AlertDialog.Builder.open(): AlertDialog = create().also { guard(it.window); it.show() }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
@@ -361,6 +363,7 @@ class MainActivity : Activity() {
                 }
             }
         }
+        guard(d.window)
         d.show()
     }
 
@@ -454,17 +457,8 @@ class MainActivity : Activity() {
     }
 
     private fun copyText(value: String, msg: String) {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText("PawKey", value)
-        // Android 13+: the clipboard preview doesn't show it.
-        if (Build.VERSION.SDK_INT >= 33) clip.description.extras = PersistableBundle().apply { putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true) }
-        cm.setPrimaryClip(clip)
+        Clipboard.copy(this, value)
         toast("$msg The clipboard clears in 30 seconds.")
-        ui.postDelayed({
-            // Only if it's still ours: never wipe something copied since.
-            val current = try { cm.primaryClip?.getItemAt(0)?.text?.toString() } catch (_: Exception) { null }
-            if (current == value && Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip()
-        }, CLIPBOARD_CLEAR_MS)
     }
 
     private fun copyCode(uid: String) {
@@ -484,7 +478,7 @@ class MainActivity : Activity() {
                     r.onSuccess { renderList(); toast("Deleted $title."); syncSoon(false) }.onFailure { toast(message(it)) }
                 }
             }
-            .show()
+            .open()
     }
 
     // ------------------------------------------------------------ adding
@@ -574,6 +568,7 @@ class MainActivity : Activity() {
                 }
             }
         }
+        guard(d.window)
         d.show()
         prefill?.let { link.setText(it) }
     }
@@ -648,7 +643,7 @@ class MainActivity : Activity() {
                 4 -> lock()
                 5 -> AlertDialog.Builder(this).setTitle("PawKey ${packageManager.getPackageInfo(packageName, 0).versionName}")
                     .setMessage("Two-factor codes, kept in an encrypted vault.\n\nMIT or Apache-2.0, as you prefer.\nhttps://github.com/anti-ghostsec/PawKey")
-                    .setPositiveButton("OK", null).show()
+                    .setPositiveButton("OK", null).open()
             }
             true
         }
@@ -680,6 +675,7 @@ class MainActivity : Activity() {
                 }
             }
         }
+        guard(d.window)
         d.show()
     }
 
@@ -724,6 +720,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Done", null).create()
         val login = s.syncLogin()
         if (login == null) syncOffPage(v, d, s) else syncOnPage(v, d, s, login)
+        guard(d.window)
         d.show()
     }
 
@@ -812,7 +809,7 @@ class MainActivity : Activity() {
                         r.onSuccess { d.dismiss(); setSyncStatus(""); toast("Sync is off.") }.onFailure { toast(message(it)) }
                     }
                 }
-                .show()
+                .open()
         }
     }
 

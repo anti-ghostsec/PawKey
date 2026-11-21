@@ -94,6 +94,10 @@ service only stores a blob of random-looking bytes and a date.
   deleted on the other both come through. If another computer saved in
   between, the service says so (409) and PawKey pulls theirs and merges
   again, as Wisp does.
+- **When the service misbehaves:** a reply that isn't sync data (a
+  maintenance page, a Wi-Fi login page) stops the sync with nothing
+  changed. If the service has no data at all for the sync ID, PawKey
+  uploads its accounts again instead of taking that as them all deleted.
 
 The format is Wisp's, which is xBrowserSync's own (v1.5+):
 
@@ -161,9 +165,14 @@ The same vault format, codes and sync as the desktop, in an app of its own:
   scanning, and nothing is saved), pick a picture of it, paste the setup
   link or key, or tap an `otpauth://` link in the browser.
 - Tap an account to copy its code (Android 13+ keeps it out of the
-  clipboard preview); long-press to delete it.
+  clipboard preview); long-press to delete it. The clipboard is cleared 30
+  seconds later, even if PawKey has been closed since. Android doesn't let
+  an app in the background look at the clipboard, so if you copy
+  something else in another app within those 30 seconds, that's cleared
+  too.
 - Locks after 5 minutes without use, or 5 minutes in the background.
-  Screenshots and screen recording of PawKey are blocked.
+  Screenshots and screen recording of PawKey are blocked, its pop-ups and
+  the camera scanner included.
 - To have the same accounts as your computer, turn sync on in one of them
   and type its sync ID and password into the other (☰ → *Sync…*).
 - No keyfiles on Android yet: a vault there is opened with its password.
