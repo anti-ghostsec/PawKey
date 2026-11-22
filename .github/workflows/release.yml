@@ -7,11 +7,10 @@ on:
   # Started by hand: builds and packages everything, publishes nothing.
   workflow_dispatch:
 
+# The build jobs run other people's code (Gradle plugins, build scripts):
+# they get a read-only token and never see the signing key.
 permissions:
-  contents: write
-  # Signed build provenance (see "Attest" below).
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -117,10 +116,8 @@ jobs:
           path: dist/*.zip
 
   # Phones run pawkey-VERSION-android-arm64.apk; the x86_64 one is for the
-  # Android emulator. Signed with PawKey's Android key (secrets
-  # ANDROID_KEYSTORE, base64, and ANDROID_KEYSTORE_PASSWORD) and checked
-  # against android/release-cert.sha256, so each APK installs over the one
-  # before. Without the key, this job does nothing and the rest still ships.
+  # Android emulator. Built here without any secrets; signed in
+  # android-sign, on a fresh runner that runs no build code.
   android:
     needs: version
     runs-on: ubuntu-24.04
@@ -131,16 +128,12 @@ jobs:
         include:
           - { abi: arm64-v8a, target: aarch64-linux-android, name: android-arm64 }
           - { abi: x86_64, target: x86_64-linux-android, name: android-x86_64 }
-    env:
-      HAVE_KEY: ${{ secrets.ANDROID_KEYSTORE != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: env.HAVE_KEY == 'true'
         with:
           # The version code counts commits.
           fetch-depth: 0
       - name: Build
-        if: env.HAVE_KEY == 'true'
         run: |
           set -eu
           export JAVA_HOME="$JAVA_HOME_21_X64" PATH="$JAVA_HOME_21_X64/bin:$PATH"
@@ -152,6 +145,39 @@ jobs:
           cargo install cargo-ndk --version 4.1.2 --locked
           PAWKEY_VERSION_CODE=$(git rev-list --count "$GITHUB_SHA") PAWKEY_VERSION_NAME="${GITHUB_REF_NAME#v}" \
             android/build-android.sh "${{ matrix.abi }}" release
+          mkdir -p unsigned
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk "unsigned/${{ matrix.name }}.apk"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-${{ matrix.name }}
+          path: unsigned/*.apk
+
+  # Signed with PawKey's Android key (secrets ANDROID_KEYSTORE, base64, and
+  # ANDROID_KEYSTORE_PASSWORD) and checked against android/release-cert.sha256,
+  # so each APK installs over the one before. Only the runner image's own
+  # apksigner runs here, next to the key. Without the key, the release
+  # ships without APKs.
+  android-sign:
+    needs: android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [android-arm64, android-x86_64]
+    env:
+      HAVE_KEY: ${{ secrets.ANDROID_KEYSTORE != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: env.HAVE_KEY == 'true'
+        with:
+          sparse-checkout: android/release-cert.sha256
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: env.HAVE_KEY == 'true'
+        with:
+          name: unsigned-${{ matrix.name }}
+          path: unsigned
       - name: Sign
         if: env.HAVE_KEY == 'true'
         env:
@@ -161,14 +187,14 @@ jobs:
         run: |
           set -eu
           export PATH="$JAVA_HOME_21_X64/bin:$PATH"
-          tools="$ANDROID_HOME/build-tools/36.0.0"
+          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
           printf '%s' "$ANDROID_KEYSTORE" | base64 -d >"$key"
           mkdir -p dist
           PAWKEY_KS_PASS=$(printf '%s' "$ANDROID_KEYSTORE_PASSWORD" | tr -d '\r\n') "$tools/apksigner" sign \
             --ks "$key" --ks-key-alias pawkey --ks-pass env:PAWKEY_KS_PASS --key-pass env:PAWKEY_KS_PASS \
-            --out "dist/$APK" android/app/build/outputs/apk/release/app-release-unsigned.apk
+            --out "dist/$APK" "unsigned/${{ matrix.name }}.apk"
           # Signed with PawKey's key, not some other one.
           got=$("$tools/apksigner" verify --print-certs "dist/$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
           [ "$got" = "$(cat android/release-cert.sha256)" ] || { echo "signed with $got, not PawKey's key" >&2; exit 1; }
@@ -179,16 +205,23 @@ jobs:
           path: dist/*.apk
 
   publish:
-    needs: [linux, windows, macos, android]
+    needs: [linux, windows, macos, android-sign]
     # Android is optional: the desktops ship without it.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: write
+      # Signed build provenance (see "Attest" below).
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
+      # Only the release files: not the unsigned APKs.
+      - run: rm -f dist/android-*.apk
       - name: Checksums
         run: cd dist && for f in *; do sha256sum "$f" >"$f.sha256"; done && ls -la
       # A signed statement, kept by GitHub (Sigstore), that each file was

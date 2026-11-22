@@ -641,6 +641,8 @@ impl App {
         self.sync.forget();
         self.rows.borrow_mut().clear();
         self.list.remove_all();
+        // Which keyfiles were used is a secret too: chosen again on unlock.
+        self.keyfiles.set(Vec::new());
         self.show_locked();
     }
 
