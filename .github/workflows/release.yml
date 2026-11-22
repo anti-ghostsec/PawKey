@@ -185,9 +185,12 @@ jobs:
           ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          set -eu
+          set -eu -o pipefail
           export PATH="$JAVA_HOME_21_X64/bin:$PATH"
-          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          # apksigner from Google's SDK repository (the same one the build uses).
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;36.0.0" >/dev/null
+          tools="$ANDROID_HOME/build-tools/36.0.0"
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
           printf '%s' "$ANDROID_KEYSTORE" | base64 -d >"$key"
@@ -196,8 +199,9 @@ jobs:
             --ks "$key" --ks-key-alias pawkey --ks-pass env:PAWKEY_KS_PASS --key-pass env:PAWKEY_KS_PASS \
             --out "dist/$APK" "unsigned/${{ matrix.name }}.apk"
           # Signed with PawKey's key, not some other one.
-          got=$("$tools/apksigner" verify --print-certs "dist/$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
-          [ "$got" = "$(cat android/release-cert.sha256)" ] || { echo "signed with $got, not PawKey's key" >&2; exit 1; }
+          certs=$("$tools/apksigner" verify --print-certs "dist/$APK")
+          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          [ "$got" = "$(cat android/release-cert.sha256)" ] || { printf '%s\n' "$certs" >&2; echo "signed with '$got', not PawKey's key" >&2; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: env.HAVE_KEY == 'true'
         with:
