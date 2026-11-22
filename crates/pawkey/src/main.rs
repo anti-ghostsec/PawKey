@@ -21,7 +21,25 @@ mod syncing;
 
 const APP_ID: &str = "io.github.anti_ghostsec.PawKey";
 const AUTO_LOCK: Duration = Duration::from_secs(5 * 60);
+/// Ticks are half a second apart; a gap this long means the computer slept.
+const SLEPT: Duration = Duration::from_secs(20);
+
+/// A moment, on two clocks: the monotonic one stops while the computer is
+/// suspended (on Linux), the wall clock doesn't. Idle is the longer of the two.
+#[derive(Clone, Copy)]
+struct Stamp(Instant, SystemTime);
+
+impl Stamp {
+    fn now() -> Stamp {
+        Stamp(Instant::now(), SystemTime::now())
+    }
+    fn elapsed(self) -> Duration {
+        self.0.elapsed().max(self.1.elapsed().unwrap_or_default())
+    }
+}
 const CLIPBOARD_CLEAR_SECS: u32 = 30;
+/// For every text box: input methods mustn't learn or upload what's typed.
+const PRIVATE_INPUT: gtk::InputHints = gtk::InputHints::PRIVATE.union(gtk::InputHints::NO_SPELLCHECK);
 const ICON_SVG: &[u8] = include_bytes!("../../../icons/pawkey.svg");
 
 const CSS: &str = "
@@ -155,6 +173,22 @@ fn show_error(label: &gtk::Label, msg: &str) {
     label.set_visible(!msg.is_empty());
 }
 
+/// The clipboard's content for a code or secret: the text, plus the marks
+/// clipboard managers and history look for to leave it out (KDE's and
+/// Linux managers', Windows' clipboard history and cloud clipboard, and
+/// macOS's concealed type).
+fn secret_clip(text: &str) -> gdk::ContentProvider {
+    let no = glib::Bytes::from_static(&[0, 0, 0, 0]);
+    gdk::ContentProvider::new_union(&[
+        gdk::ContentProvider::for_value(&text.to_value()),
+        gdk::ContentProvider::for_bytes("x-kde-passwordManagerHint", &glib::Bytes::from_static(b"secret")),
+        gdk::ContentProvider::for_bytes("ExcludeClipboardContentFromMonitorProcessing", &no),
+        gdk::ContentProvider::for_bytes("CanIncludeInClipboardHistory", &no),
+        gdk::ContentProvider::for_bytes("CanUploadToCloudClipboard", &no),
+        gdk::ContentProvider::for_bytes("org.nspasteboard.ConcealedType", &glib::Bytes::from(text.as_bytes())),
+    ])
+}
+
 // ---------------------------------------------------------------- keyfiles
 
 /// "Keyfiles…" and "Clear" buttons, a line saying which are chosen, and
@@ -275,7 +309,10 @@ struct Inner {
     toast_gen: Cell<u32>,
     vault: RefCell<Option<Vault>>,
     rows: RefCell<Vec<Row>>,
-    last_active: Cell<Instant>,
+    last_active: Cell<Stamp>,
+    last_tick: Cell<Stamp>,
+    /// logind's suspend and lock signals, for as long as the window.
+    session_signals: RefCell<Vec<gio::SignalSubscription>>,
     sync: syncing::SyncUi,
 }
 
@@ -432,7 +469,9 @@ impl App {
             toast_gen: Cell::new(0),
             vault: RefCell::new(None),
             rows: RefCell::new(Vec::new()),
-            last_active: Cell::new(Instant::now()),
+            last_active: Cell::new(Stamp::now()),
+            last_tick: Cell::new(Stamp::now()),
+            session_signals: RefCell::default(),
             sync: syncing::SyncUi::new(),
         }));
         sync_slot.append(&app.sync.button);
@@ -543,13 +582,13 @@ impl App {
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let a = self.clone();
         keys.connect_key_pressed(move |_, _, _, _| {
-            a.last_active.set(Instant::now());
+            a.last_active.set(Stamp::now());
             glib::Propagation::Proceed
         });
         self.window.add_controller(keys);
         let motion = gtk::EventControllerMotion::new();
         let a = self.clone();
-        motion.connect_motion(move |_, _, _| a.last_active.set(Instant::now()));
+        motion.connect_motion(move |_, _, _| a.last_active.set(Stamp::now()));
         self.window.add_controller(motion);
 
         let a = self.clone();
@@ -557,6 +596,7 @@ impl App {
             a.tick();
             glib::ControlFlow::Continue
         });
+        self.lock_with_the_session();
     }
 
     // ------------------------------------------------------------ locking
@@ -590,8 +630,8 @@ impl App {
         let creating = !self.path.exists();
         let pw = Zeroizing::new(self.pw1.text().to_string());
         if creating {
-            if pw.is_empty() && self.keyfiles.get().is_empty() {
-                return show_error(&self.unlock_error, "Pick a password (a long one).");
+            if let Some(e) = vault::password_problem(&pw, !self.keyfiles.get().is_empty()) {
+                return show_error(&self.unlock_error, &e);
             }
             if *pw != self.pw2.text().as_str() {
                 return show_error(&self.unlock_error, "The two passwords don't match.");
@@ -625,7 +665,7 @@ impl App {
         self.pw1.set_text("");
         self.pw2.set_text("");
         self.search.set_text("");
-        self.last_active.set(Instant::now());
+        self.last_active.set(Stamp::now());
         for b in &self.chrome {
             b.set_visible(true);
         }
@@ -635,9 +675,59 @@ impl App {
         self.sync_soon(true);
     }
 
+    /// Locks when the screen locks or the screensaver starts, and before the
+    /// computer suspends (where the system says so: GTK's session tracking,
+    /// and logind on Linux). After any other sleep, the next tick locks.
+    fn lock_with_the_session(&self) {
+        if let Some(gapp) = self.window.application() {
+            let a = self.clone();
+            gapp.connect_screensaver_active_notify(move |g| {
+                if g.is_screensaver_active() && a.vault.borrow().is_some() {
+                    a.lock();
+                }
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let a = self.clone();
+            gio::bus_get(gio::BusType::System, gio::Cancellable::NONE, move |bus| {
+                let Ok(bus) = bus else { return };
+                let lock_on = |member: &'static str, interface: &'static str| {
+                    let a = a.clone();
+                    bus.subscribe_to_signal(
+                        Some("org.freedesktop.login1"),
+                        Some(interface),
+                        Some(member),
+                        None,
+                        None,
+                        gio::DBusSignalFlags::NONE,
+                        move |sig| {
+                            // PrepareForSleep(true): about to suspend. Lock(): the session locks.
+                            let going = member != "PrepareForSleep" || sig.parameters.child_value(0).get::<bool>() == Some(true);
+                            if going && a.vault.borrow().is_some() {
+                                a.lock();
+                            }
+                        },
+                    )
+                };
+                let subs = vec![lock_on("PrepareForSleep", "org.freedesktop.login1.Manager"), lock_on("Lock", "org.freedesktop.login1.Session")];
+                *a.session_signals.borrow_mut() = subs;
+            });
+        }
+    }
+
     fn lock(&self) {
         // Dropping the vault wipes its key and every secret.
         *self.vault.borrow_mut() = None;
+        // Dialogs too: what's in them (a new account's secret, the sync
+        // password) mustn't outlive the lock.
+        if let Some(gapp) = self.window.application() {
+            for w in gapp.windows() {
+                if w != *self.window.upcast_ref::<gtk::Window>() {
+                    w.close();
+                }
+            }
+        }
         self.sync.forget();
         self.rows.borrow_mut().clear();
         self.list.remove_all();
@@ -696,7 +786,9 @@ impl App {
     }
 
     fn tick(&self) {
-        if self.vault.borrow().is_some() && self.last_active.get().elapsed() >= AUTO_LOCK {
+        let slept = self.last_tick.get().elapsed() >= SLEPT;
+        self.last_tick.set(Stamp::now());
+        if self.vault.borrow().is_some() && (slept || self.last_active.get().elapsed() >= AUTO_LOCK) {
             self.lock();
             return;
         }
@@ -731,10 +823,15 @@ impl App {
     /// Copies a code or a sync login, and clears it again later.
     fn copy_text(&self, text: String, msg: &str) {
         let cb = self.window.clipboard();
-        cb.set_text(&text);
+        if cb.set_content(Some(&secret_clip(&text))).is_err() {
+            cb.set_text(&text);
+        }
         self.notify(&format!("{msg} The clipboard clears in {CLIPBOARD_CLEAR_SECS} seconds."));
         let text = Zeroizing::new(text);
+        // Keeps PawKey running until then, even if the window is closed.
+        let hold = self.window.application().map(|g| g.hold());
         glib::spawn_future_local(async move {
+            let _hold = hold;
             glib::timeout_future_seconds(CLIPBOARD_CLEAR_SECS).await;
             // Only if it's still ours: never wipe something copied since.
             if let Ok(Some(t)) = cb.read_text_future().await {
@@ -819,7 +916,12 @@ impl App {
             .xalign(0.0)
             .build();
         intro.add_css_class("dim");
-        let link = gtk::Entry::builder().placeholder_text("otpauth:// link, or the secret key").hexpand(true).activates_default(true).build();
+        let link = gtk::Entry::builder()
+            .input_hints(PRIVATE_INPUT)
+            .placeholder_text("otpauth:// link, or the secret key")
+            .hexpand(true)
+            .activates_default(true)
+            .build();
         let qr_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let open_qr = gtk::Button::with_label("QR from a picture…");
         let paste_qr = gtk::Button::with_label("Paste a QR picture");
@@ -827,8 +929,9 @@ impl App {
         paste_qr.set_hexpand(true);
         qr_row.append(&open_qr);
         qr_row.append(&paste_qr);
-        let issuer = gtk::Entry::builder().placeholder_text("Service (GitHub, say)").activates_default(true).build();
-        let name = gtk::Entry::builder().placeholder_text("Account (you@example.com, say)").activates_default(true).build();
+        let issuer = gtk::Entry::builder().input_hints(PRIVATE_INPUT).placeholder_text("Service (GitHub, say)").activates_default(true).build();
+        let name =
+            gtk::Entry::builder().input_hints(PRIVATE_INPUT).placeholder_text("Account (you@example.com, say)").activates_default(true).build();
 
         let grid = gtk::Grid::builder().row_spacing(6).column_spacing(12).margin_top(6).build();
         let digits = gtk::DropDown::from_strings(&["6", "7", "8"]);
@@ -992,8 +1095,8 @@ impl App {
         let w2 = win.clone();
         ok.connect_clicked(move |ok| {
             let pw = Zeroizing::new(pw1.text().to_string());
-            if pw.is_empty() && kf.get().is_empty() {
-                return show_error(&err, "Pick a password.");
+            if let Some(e) = vault::password_problem(&pw, !kf.get().is_empty()) {
+                return show_error(&err, &e);
             }
             if *pw != pw2.text().as_str() {
                 return show_error(&err, "The two passwords don't match.");
@@ -1076,6 +1179,7 @@ impl App {
 }
 
 fn main() -> glib::ExitCode {
+    pawkey_core::harden_process();
     let mut args = std::env::args();
     let argv0 = args.next().unwrap_or_else(|| "pawkey".into());
     let mut path = vault::default_path();
@@ -1103,7 +1207,8 @@ fn main() -> glib::ExitCode {
         }
     }
 
-    let gapp = gtk::Application::builder().application_id(APP_ID).build();
+    // register_session: so GTK says when the screensaver starts (see lock_with_the_session).
+    let gapp = gtk::Application::builder().application_id(APP_ID).register_session(true).build();
     gapp.connect_startup(|_| {
         set_dark(!light_theme_marker().exists());
         load_css();

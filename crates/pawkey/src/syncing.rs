@@ -2,8 +2,9 @@
 //! running `pawkey_core::sync` off the UI thread over libsoup (as Wisp does).
 //!
 //! Sync runs when the vault is unlocked, after an account is added or
-//! deleted, when the button is clicked, and once a minute otherwise (a tiny
-//! "has it changed?" request unless something here changed).
+//! deleted, when the button is clicked, and every minute or two otherwise (a
+//! tiny "has it changed?" request unless something here changed; the
+//! interval varies, so the requests don't keep a beat).
 
 use std::collections::BTreeSet;
 
@@ -14,7 +15,10 @@ use soup::prelude::*;
 
 use super::*;
 
-const CHECK_EVERY: Duration = Duration::from_secs(60);
+/// A random time between checks, 45 s to 2 min.
+fn check_every() -> Duration {
+    Duration::from_secs(glib::random_int_range(45, 121) as u64)
+}
 
 pub struct SyncUi {
     pub button: gtk::Button,
@@ -24,6 +28,7 @@ pub struct SyncUi {
     /// Another run wanted while one was going; `true` if it must not be skipped.
     again: Cell<Option<bool>>,
     last_run: Cell<Option<Instant>>,
+    next_in: Cell<Duration>,
     status: RefCell<String>,
     status_labels: RefCell<Vec<glib::WeakRef<gtk::Label>>>,
 }
@@ -39,6 +44,7 @@ impl SyncUi {
             running: Cell::new(false),
             again: Cell::new(None),
             last_run: Cell::new(None),
+            next_in: Cell::new(check_every()),
             status: RefCell::new(String::new()),
             status_labels: RefCell::new(Vec::new()),
         }
@@ -53,13 +59,17 @@ impl SyncUi {
     }
 }
 
-/// libsoup, blocking: made and used on one worker thread.
+/// libsoup, blocking: made and used on one worker thread. `proxy` is
+/// empty (the system's settings) or a checked `socks5://host:port`.
 struct Soup(soup::Session);
 
 impl Soup {
-    fn new() -> Soup {
+    fn new(proxy: &str) -> Soup {
         let session = soup::Session::new();
         session.set_timeout(30);
+        if !proxy.is_empty() {
+            session.set_proxy_resolver(Some(&gio::SimpleProxyResolver::new(Some(proxy), &[] as &[&str])));
+        }
         Soup(session)
     }
 }
@@ -70,17 +80,18 @@ impl Transport for Soup {
             return Err("The sync service's address must start with https://.".into());
         }
         let msg = soup::Message::new(method, url).map_err(|e| format!("Bad address {url}: {e}"))?;
+        // A redirect could lead anywhere, plain HTTP included: not followed.
+        msg.add_flags(soup::MessageFlags::NO_REDIRECT);
         if let Some(b) = body {
             let bytes = glib::Bytes::from_owned(b.to_string().into_bytes());
             msg.set_request_body_from_bytes(Some("application/json"), Some(&bytes));
         }
         let bytes = self.0.send_and_read(&msg, gio::Cancellable::NONE).map_err(|e| format!("Can't reach the sync service: {e}"))?;
         let status = msg.status().into_glib();
-        let parsed: Result<Json, _> = serde_json::from_slice(&bytes);
         if !(200..300).contains(&status) {
-            let msg = parsed.ok().and_then(|j| j["message"].as_str().map(str::to_string));
-            return Err(format!("{status} {}", msg.as_deref().unwrap_or("request failed")));
+            return Err(sync::http_error(status as u16));
         }
+        let parsed: Result<Json, _> = serde_json::from_slice(&bytes);
         // A web page instead of JSON (a captive portal, maintenance): an error.
         parsed.map_err(|_| sync::NOT_SYNC_DATA.to_string())
     }
@@ -92,6 +103,13 @@ fn uid_set(accounts: &[Account]) -> BTreeSet<&str> {
 
 fn clock() -> String {
     glib::DateTime::now_local().ok().and_then(|d| d.format("%H:%M").ok()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// The proxy box: empty for the system's settings, or socks5://host:port.
+fn proxy_entry(text: &str) -> gtk::Entry {
+    let e = gtk::Entry::builder().text(text).placeholder_text(format!("None, or {} for Tor", sync::TOR_PROXY)).build();
+    e.set_input_hints(gtk::InputHints::NO_SPELLCHECK | gtk::InputHints::PRIVATE);
+    e
 }
 
 impl App {
@@ -126,7 +144,7 @@ impl App {
     }
 
     pub(super) fn sync_tick(&self) {
-        if !self.sync.running.get() && self.sync.last_run.get().is_some_and(|t| t.elapsed() >= CHECK_EVERY) {
+        if !self.sync.running.get() && self.sync.last_run.get().is_some_and(|t| t.elapsed() >= self.sync.next_in.get()) {
             self.sync_soon(false);
         }
     }
@@ -146,12 +164,13 @@ impl App {
         let key = self.sync.key.borrow().as_ref().filter(|(a, _)| *a == account).map(|(_, k)| k.clone());
         self.sync.running.set(true);
         self.sync.last_run.set(Some(Instant::now()));
+        self.sync.next_in.set(check_every());
         self.sync.button.set_sensitive(false);
         self.refresh_sync_button();
         let (a, old_base, acct) = (self.clone(), state.base.clone(), account.clone());
         glib::spawn_future_local(async move {
             let res = gio::spawn_blocking(move || -> Result<(Key, Option<sync::Outcome>), String> {
-                let t = Soup::new();
+                let t = Soup::new(&state.proxy);
                 let key = key.unwrap_or_else(|| sync::derive_key(&account));
                 let dirty = uid_set(&local) != state.base.iter().map(String::as_str).collect();
                 if !force && !dirty && !sync::remote_changed(&t, &state)? {
@@ -188,6 +207,7 @@ impl App {
                     v.accounts = merged;
                     v.sync.base = out.base.clone();
                     v.sync.last_updated = out.last_updated.clone();
+                    v.sync.seq = out.seq;
                     if let Err(e) = v.save() {
                         (v.accounts, v.sync) = before;
                         drop(vault);
@@ -211,11 +231,11 @@ impl App {
     }
 
     /// Saves a new sync login and syncs straight away.
-    fn turn_sync_on(&self, account: SyncAccount, key: Key) -> Result<(), String> {
+    fn turn_sync_on(&self, account: SyncAccount, key: Key, proxy: String) -> Result<(), String> {
         let mut vault = self.vault.borrow_mut();
         let v = vault.as_mut().ok_or("PawKey is locked.")?;
         let before = v.sync.clone();
-        v.sync = SyncState { account: Some(account.clone()), base: Vec::new(), last_updated: String::new() };
+        v.sync = SyncState { account: Some(account.clone()), proxy, ..Default::default() };
         if let Err(e) = v.save() {
             v.sync = before;
             return Err(format!("Couldn't save: {e}"));
@@ -224,6 +244,17 @@ impl App {
         *self.sync.key.borrow_mut() = Some((account, key));
         self.set_sync_status(String::new());
         self.sync_soon(true);
+        Ok(())
+    }
+
+    fn set_proxy(&self, proxy: String) -> Result<(), String> {
+        let mut vault = self.vault.borrow_mut();
+        let v = vault.as_mut().ok_or("PawKey is locked.")?;
+        let before = std::mem::replace(&mut v.sync.proxy, proxy);
+        if let Err(e) = v.save() {
+            v.sync.proxy = before;
+            return Err(format!("Couldn't save: {e}"));
+        }
         Ok(())
     }
 
@@ -264,13 +295,16 @@ impl App {
             .wrap(true)
             .xalign(0.0)
             .build();
-        let service = gtk::Entry::builder().text(sync::DEFAULT_SERVICE).build();
+        let service = gtk::Entry::builder().input_hints(PRIVATE_INPUT).text(sync::DEFAULT_SERVICE).build();
         let service_label = gtk::Label::builder().label("Service").xalign(0.0).build();
         service_label.add_css_class("dim");
+        let proxy = proxy_entry("");
+        let proxy_label = gtk::Label::builder().label("Proxy (optional)").xalign(0.0).build();
+        proxy_label.add_css_class("dim");
         let new_btn = gtk::Button::with_label("Make a new sync ID");
         new_btn.add_css_class("suggested-action");
         let or = gtk::Label::builder().label("Or use a sync ID you already have, from another PawKey (or Wisp's):").wrap(true).xalign(0.0).build();
-        let id = gtk::Entry::builder().placeholder_text("Sync ID").build();
+        let id = gtk::Entry::builder().input_hints(PRIVATE_INPUT).placeholder_text("Sync ID").build();
         let pw = gtk::PasswordEntry::builder().show_peek_icon(true).placeholder_text("Sync password").build();
         let connect_btn = gtk::Button::with_label("Connect");
         let spinner = gtk::Spinner::new();
@@ -279,6 +313,8 @@ impl App {
             intro.upcast_ref::<gtk::Widget>(),
             service_label.upcast_ref(),
             service.upcast_ref(),
+            proxy_label.upcast_ref(),
+            proxy.upcast_ref(),
             new_btn.upcast_ref(),
             gtk::Separator::new(gtk::Orientation::Horizontal).upcast_ref(),
             or.upcast_ref(),
@@ -301,9 +337,9 @@ impl App {
         };
         let finish = {
             let (a, win, err, busy) = (self.clone(), win.clone(), err.clone(), busy.clone());
-            move |res: Result<(SyncAccount, Key), String>| {
+            move |res: Result<(SyncAccount, Key, String), String>| {
                 busy(false);
-                match res.and_then(|(acct, key)| a.turn_sync_on(acct, key)) {
+                match res.and_then(|(acct, key, proxy)| a.turn_sync_on(acct, key, proxy)) {
                     Ok(()) => {
                         win.close();
                         a.sync_dialog();
@@ -313,16 +349,20 @@ impl App {
             }
         };
 
-        let (s2, busy2, finish2) = (service.clone(), busy.clone(), finish.clone());
+        let (s2, p2, busy2, finish2, e2) = (service.clone(), proxy.clone(), busy.clone(), finish.clone(), err.clone());
         new_btn.connect_clicked(move |_| {
+            let proxy = match sync::check_proxy(&p2.text()) {
+                Ok(p) => p,
+                Err(e) => return show_error(&e2, &e),
+            };
             busy2(true);
             let service = s2.text().to_string();
             let finish = finish2.clone();
             glib::spawn_future_local(async move {
                 let res = gio::spawn_blocking(move || {
-                    let account = sync::create_account(&Soup::new(), &service)?;
+                    let account = sync::create_account(&Soup::new(&proxy), &service)?;
                     let key = sync::derive_key(&account);
-                    Ok((account, key))
+                    Ok((account, key, proxy))
                 })
                 .await
                 .unwrap_or_else(|_| Err("Something went wrong.".into()));
@@ -335,11 +375,16 @@ impl App {
             if account.id.is_empty() || account.password.is_empty() {
                 return show_error(&err2, "Type the sync ID and its password.");
             }
+            let proxy = match sync::check_proxy(&proxy.text()) {
+                Ok(p) => p,
+                Err(e) => return show_error(&err2, &e),
+            };
             busy(true);
             let finish = finish.clone();
             glib::spawn_future_local(async move {
-                let res =
-                    gio::spawn_blocking(move || sync::connect(&Soup::new(), &account)).await.unwrap_or_else(|_| Err("Something went wrong.".into()));
+                let res = gio::spawn_blocking(move || sync::connect(&Soup::new(&proxy), &account).map(|(a, k)| (a, k, proxy)))
+                    .await
+                    .unwrap_or_else(|_| Err("Something went wrong.".into()));
                 finish(res);
             });
         });
@@ -376,6 +421,14 @@ impl App {
         row(1, "Sync ID", label(&account.id).upcast_ref(), Some((account.id.clone(), "sync ID")));
         let pw = gtk::PasswordEntry::builder().text(&account.password).show_peek_icon(true).editable(false).build();
         row(2, "Password", pw.upcast_ref(), Some((account.password.clone(), "sync password")));
+        let current = self.vault.borrow().as_ref().map(|v| v.sync.proxy.clone()).unwrap_or_default();
+        let proxy = proxy_entry(&current);
+        let proxy_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let save_proxy = gtk::Button::with_label("Use");
+        proxy.set_hexpand(true);
+        proxy_box.append(&proxy);
+        proxy_box.append(&save_proxy);
+        row(3, "Proxy", proxy_box.upcast_ref(), None);
 
         let how = gtk::Label::builder()
             .label(
@@ -400,25 +453,60 @@ impl App {
 
         let a = self.clone();
         now_btn.connect_clicked(move |_| a.sync_soon(true));
+        let (a, e2) = (self.clone(), err.clone());
+        save_proxy.connect_clicked(move |_| match sync::check_proxy(&proxy.text()).and_then(|p| a.set_proxy(p.clone()).map(|_| p)) {
+            Ok(p) => {
+                proxy.set_text(&p);
+                show_error(&e2, "");
+                a.notify(if p.is_empty() { "Sync uses the system's proxy settings." } else { "Sync goes through the proxy." });
+                a.sync_soon(true);
+            }
+            Err(e) => show_error(&e2, &e),
+        });
         let (a, win) = (self.clone(), win.clone());
         off_btn.connect_clicked(move |_| {
             let ask = gtk::AlertDialog::builder()
                 .modal(true)
                 .message("Turn off sync on this computer?")
-                .detail("Your accounts stay here, and on the service for your other computers. To sync again, use the same sync ID and password: copy them first if you haven't kept them.")
-                .buttons(["Cancel", "Turn off"])
+                .detail(
+                    "Your accounts stay here. On the service they can stay for your other computers, or be removed: then nobody \
+                     with the sync password can get them from there, and your other computers stop syncing (keeping their accounts).",
+                )
+                .buttons(["Cancel", "Turn off", "Turn off and remove them from the service"])
                 .cancel_button(0)
                 .default_button(0)
                 .build();
             let (a, win, err) = (a.clone(), win.clone(), err.clone());
             glib::spawn_future_local(async move {
-                if ask.choose_future(Some(&win)).await != Ok(1) {
-                    return;
+                let remove = match ask.choose_future(Some(&win)).await {
+                    Ok(1) => false,
+                    Ok(2) => true,
+                    _ => return,
+                };
+                if remove {
+                    let Some((state, key)) = a.vault.borrow().as_ref().map(|v| v.sync.clone()).and_then(|st| {
+                        let key = a.sync.key.borrow().as_ref().filter(|(acc, _)| Some(acc) == st.account.as_ref()).map(|(_, k)| k.clone());
+                        Some((st, key))
+                    }) else {
+                        return;
+                    };
+                    let res = gio::spawn_blocking(move || {
+                        let key = match key {
+                            Some(k) => k,
+                            None => sync::derive_key(state.account.as_ref().ok_or("Sync is off.")?),
+                        };
+                        sync::wipe(&Soup::new(&state.proxy), &state, &key)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("Something went wrong.".into()));
+                    if let Err(e) = res {
+                        return show_error(&err, &format!("Couldn't remove them from the service, so sync is still on: {e}"));
+                    }
                 }
                 match a.turn_sync_off() {
                     Ok(()) => {
                         win.close();
-                        a.notify("Sync is off.");
+                        a.notify(if remove { "Sync is off, and PawKey's accounts are off the service." } else { "Sync is off." });
                     }
                     Err(e) => show_error(&err, &e),
                 }
@@ -519,8 +607,8 @@ pub(crate) mod tests {
 
     fn device(gapp: &gtk::Application, dir: &std::path::Path, name: &str) -> App {
         let app = App::build(gapp, dir.join(name).join("pawkey.vault"));
-        app.pw1.set_text("pw");
-        app.pw2.set_text("pw");
+        app.pw1.set_text("pw-test-123");
+        app.pw2.set_text("pw-test-123");
         app.unlock();
         assert!(spin_until(|| app.vault.borrow().is_some()));
         app
@@ -557,13 +645,13 @@ pub(crate) mod tests {
         add(&b, "Bank");
 
         // A makes a sync ID; B joins with it.
-        let account = sync::create_account(&Soup::new(), &service).unwrap();
+        let account = sync::create_account(&Soup::new(""), &service).unwrap();
         let key = sync::derive_key(&account);
-        a.turn_sync_on(account.clone(), key).unwrap();
+        a.turn_sync_on(account.clone(), key, String::new()).unwrap();
         assert!(spin_until(|| settled(&a) && a.sync.status.borrow().starts_with("Synced")), "{}", a.sync.status.borrow());
         assert!(a.sync.button.property::<bool>("visible"));
-        let (account_b, key_b) = sync::connect(&Soup::new(), &account).unwrap();
-        b.turn_sync_on(account_b, key_b).unwrap();
+        let (account_b, key_b) = sync::connect(&Soup::new(""), &account).unwrap();
+        b.turn_sync_on(account_b, key_b, String::new()).unwrap();
         assert!(spin_until(|| settled(&b) && b.sync.status.borrow().starts_with("Synced")), "{}", b.sync.status.borrow());
         a.sync_soon(true);
         assert!(spin_until(|| settled(&a)));
@@ -582,7 +670,7 @@ pub(crate) mod tests {
 
         // It survives locking: the sync login is in the vault.
         a.lock();
-        a.pw1.set_text("pw");
+        a.pw1.set_text("pw-test-123");
         a.unlock();
         assert!(spin_until(|| a.vault.borrow().is_some() && settled(&a) && a.sync.status.borrow().starts_with("Synced")));
         assert_eq!(a.sync_account().unwrap().id, account.id);

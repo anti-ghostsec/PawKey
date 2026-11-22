@@ -80,6 +80,16 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 /// Where PawKey keeps its files: `~/.local/share/pawkey` on Linux (or
 /// `$XDG_DATA_HOME/pawkey`), `%APPDATA%\PawKey` on Windows, and
 /// `~/Library/Application Support/PawKey` on macOS.
+/// The shortest new password PawKey takes without keyfiles.
+pub const MIN_PASSWORD: usize = 10;
+
+/// Why a new password won't do, if it won't. With keyfiles any password
+/// goes (the keyfiles carry the strength); without, at least [`MIN_PASSWORD`].
+pub fn password_problem(password: &str, keyfiles: bool) -> Option<String> {
+    (!keyfiles && password.chars().count() < MIN_PASSWORD)
+        .then(|| format!("Pick a password of at least {MIN_PASSWORD} characters (longer is better: it's all that protects your codes)."))
+}
+
 pub fn data_dir() -> PathBuf {
     if cfg!(windows) {
         return env_dir("APPDATA").unwrap_or_else(|| PathBuf::from(".")).join("PawKey");

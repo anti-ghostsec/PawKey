@@ -18,6 +18,12 @@
 //! `base` was added here; one in `base` and gone from the service was
 //! deleted elsewhere; and so on. A PUT answered 409 (another device saved
 //! meanwhile) means pulling again and merging again, as Wisp does.
+//!
+//! One more entry, [`STATE_TITLE`], holds a counter that every upload
+//! raises, a "wiped" mark, and padding. A device refuses data whose counter
+//! is lower than one it has seen (an old copy played back by the service or
+//! someone between), and the padding rounds the data up to 4 KiB steps so
+//! its size doesn't tell how many accounts there are.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -42,6 +48,9 @@ pub const PREFIX: &str = "t_";
 /// xBrowserSync's default container for bookmarks that aren't on a toolbar/menu.
 const OTHER_CONTAINER: &str = "[xbs] Other";
 const ATTEMPTS: usize = 5;
+/// The entry with the counter, the wiped mark and the padding.
+pub const STATE_TITLE: &str = "t_~pawkey sync state~";
+const PAD_TO: usize = 4096;
 
 type Cipher = AesGcm<Aes256, U16>;
 pub type Key = Zeroizing<[u8; 32]>;
@@ -60,6 +69,33 @@ pub struct SyncState {
     /// The uids of PawKey's accounts on the service after the last sync.
     pub base: Vec<String>,
     pub last_updated: String,
+    /// The highest counter seen on the service: older data is refused.
+    #[serde(default)]
+    pub seq: u64,
+    /// A SOCKS5 proxy for every sync request (`socks5://127.0.0.1:9050` for
+    /// Tor), or empty for the system's own settings. See [`check_proxy`].
+    #[serde(default)]
+    pub proxy: String,
+}
+
+pub const TOR_PROXY: &str = "socks5://127.0.0.1:9050";
+
+/// A proxy address as PawKey keeps it: empty (none), or `socks5://host:port`.
+/// SOCKS5 only, so names are looked up by the proxy (by Tor), not here.
+pub fn check_proxy(text: &str) -> Result<String, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(String::new());
+    }
+    let bad = || "A proxy is socks5://host:port (for Tor, socks5://127.0.0.1:9050).".to_string();
+    let rest = t.strip_prefix("socks5://").or_else(|| t.strip_prefix("socks5h://")).ok_or_else(bad)?;
+    let (host, port) = rest.trim_end_matches('/').rsplit_once(':').ok_or_else(bad)?;
+    let port: u16 = port.parse().map_err(|_| bad())?;
+    let host_ok = !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || ".-[]:".contains(c));
+    if !host_ok || port == 0 {
+        return Err(bad());
+    }
+    Ok(format!("socks5://{host}:{port}"))
 }
 
 /// Talking to the service: a JSON request, the JSON answer. A status other
@@ -367,6 +403,43 @@ pub fn merge(local: &[Account], base: &[String], remote: &[Account]) -> Vec<Acco
     out
 }
 
+// ---------------------------------------------------------------- the state entry
+
+fn is_state(node: &Json) -> bool {
+    node["title"].as_str() == Some(STATE_TITLE)
+}
+
+/// The counter and wiped mark in a tree (0 and false without the entry).
+fn state_in(tree: &Json) -> (u64, bool) {
+    fn find(node: &Json) -> Option<&Json> {
+        match node {
+            Json::Array(items) => items.iter().find_map(find),
+            Json::Object(o) if is_state(node) => Some(node).filter(|_| o.contains_key("description")),
+            Json::Object(o) => o.get("children").and_then(find),
+            _ => None,
+        }
+    }
+    let Some(d) = find(tree).and_then(|n| n["description"].as_str()).and_then(|d| serde_json::from_str::<Json>(d).ok()) else {
+        return (0, false);
+    };
+    (d["seq"].as_u64().unwrap_or(0), d["wiped"].as_bool().unwrap_or(false))
+}
+
+/// `tree` (already through [`with_accounts`], which drops the old state
+/// entry) with a new state entry, as text padded to [`PAD_TO`] steps.
+fn sealed_text(mut tree: Json, seq: u64, wiped: bool) -> Zeroizing<String> {
+    let id = max_id(&tree) + 1;
+    let entry = |pad: usize| {
+        let d = json!({ "seq": seq, "wiped": wiped, "pad": "0".repeat(pad) });
+        json!({ "id": id, "title": STATE_TITLE, "url": "about:blank", "description": d.to_string() })
+    };
+    other_container(&mut tree).push(entry(0));
+    let len = tree.to_string().len();
+    let pad = (PAD_TO - len % PAD_TO) % PAD_TO;
+    *other_container(&mut tree).last_mut().unwrap() = entry(pad);
+    Zeroizing::new(tree.to_string())
+}
+
 // ---------------------------------------------------------------- syncing
 
 pub struct Outcome {
@@ -375,8 +448,28 @@ pub struct Outcome {
     /// The new `SyncState::base` and `last_updated`.
     pub base: Vec<String>,
     pub last_updated: String,
+    /// The new `SyncState::seq`.
+    pub seq: u64,
     /// Whether anything was uploaded.
     pub uploaded: bool,
+}
+
+pub const ROLLED_BACK: &str = "The sync data on the service is older than what this device has already seen: an old copy may have been put back. Nothing was changed. (A device with a PawKey older than 0.1.2 does this too: update it.)";
+pub const WIPED: &str = "PawKey's accounts were removed from the service from another device. Nothing was changed here. Turn sync off on this device, or set it up again.";
+
+/// What a failed request says: the status, in PawKey's own words. The
+/// service's own text isn't shown, so it can't put words in PawKey's mouth.
+pub fn http_error(status: u16) -> String {
+    let what = match status {
+        404 => "This sync ID isn't on the service.",
+        409 => "Another device saved at the same time.",
+        413 => "The service won't take this much data.",
+        429 => "The service says too many requests; it'll try again later.",
+        400..=499 => "The service refused the request.",
+        500..=599 => "The sync service is having trouble; it'll try again later.",
+        _ => "The sync service answered strangely.",
+    };
+    format!("{status} {what}")
 }
 
 pub const NOT_SYNC_DATA: &str = "The sync service sent something that isn't sync data (is it down for maintenance?). Nothing was changed.";
@@ -411,21 +504,30 @@ pub fn sync(t: &dyn Transport, state: &SyncState, key: &[u8; 32], local: &[Accou
         } else {
             serde_json::from_str(&decrypt(key, blob)?).map_err(|e| format!("The sync data isn't valid JSON: {e}"))?
         };
+        let (remote_seq, wiped) = state_in(&tree);
+        let joining = state.base.is_empty() && state.seq == 0;
+        if wiped && !joining {
+            return Err(WIPED.into());
+        }
+        if !blob.is_empty() && remote_seq < state.seq {
+            return Err(ROLLED_BACK.into());
+        }
         let remote = accounts_in(&tree);
         // Nothing on the service at all (new, or emptied there): upload
         // what's here rather than take it as everything deleted.
         let base: &[String] = if blob.is_empty() { &[] } else { &state.base };
         let merged = merge(local, base, &remote);
         let base = merged.iter().map(|a| a.uid.clone()).collect();
-        if merged == remote {
-            return Ok(Outcome { accounts: merged, base, last_updated, uploaded: false });
+        if merged == remote && !wiped && !blob.is_empty() {
+            return Ok(Outcome { accounts: merged, base, last_updated, seq: remote_seq, uploaded: false });
         }
-        let text = Zeroizing::new(with_accounts(&tree, &merged).to_string());
+        let seq = remote_seq.max(state.seq) + 1;
+        let text = sealed_text(with_accounts(&tree, &merged), seq, false);
         let body = json!({ "bookmarks": encrypt(key, &text)?, "lastUpdated": last_updated });
         match t.request("PUT", &url, Some(&body)) {
             Ok(res) => {
                 let (_, last_updated) = sync_data(&res)?;
-                return Ok(Outcome { accounts: merged, base, last_updated, uploaded: true });
+                return Ok(Outcome { accounts: merged, base, last_updated, seq, uploaded: true });
             }
             // Another device saved in between: pull theirs and merge again.
             Err(e) if e.starts_with("409") => continue,
@@ -433,6 +535,32 @@ pub fn sync(t: &dyn Transport, state: &SyncState, key: &[u8; 32], local: &[Accou
         }
     }
     Err("Sync kept clashing with another device; it'll try again.".into())
+}
+
+/// Removes PawKey's accounts from the service (anything else there stays),
+/// for a sync login that may have fallen into other hands. Other devices
+/// then stop syncing with [`WIPED`], keeping their accounts.
+pub fn wipe(t: &dyn Transport, state: &SyncState, key: &[u8; 32]) -> Result<(), String> {
+    let account = state.account.as_ref().ok_or("Sync is off.")?;
+    let url = format!("{}/bookmarks/{}", account.service, account.id);
+    for _ in 0..ATTEMPTS {
+        let data = t.request("GET", &url, None)?;
+        let (blob, last_updated) = sync_data(&data)?;
+        let tree: Json = if blob.is_empty() {
+            json!([])
+        } else {
+            serde_json::from_str(&decrypt(key, blob)?).map_err(|e| format!("The sync data isn't valid JSON: {e}"))?
+        };
+        let seq = state_in(&tree).0.max(state.seq) + 1;
+        let text = sealed_text(with_accounts(&tree, &[]), seq, true);
+        let body = json!({ "bookmarks": encrypt(key, &text)?, "lastUpdated": last_updated });
+        match t.request("PUT", &url, Some(&body)) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.starts_with("409") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("Sync kept clashing with another device; try again.".into())
 }
 
 /// Whether the service changed since `state.last_updated` (a tiny request).
@@ -528,6 +656,7 @@ mod tests {
         *local = merge(local, &state.base, &out.accounts);
         state.base = out.base;
         state.last_updated = out.last_updated;
+        state.seq = out.seq;
     }
 
     fn issuers(v: &[Account]) -> Vec<&str> {
@@ -610,6 +739,70 @@ mod tests {
     }
 
     #[test]
+    fn an_old_copy_played_back_is_refused() {
+        let t = FakeService::default();
+        let mut account = create_account(&t, "https://sync.test").unwrap();
+        account.password = "pw".into();
+        let key = derive_key(&account);
+        let mut state = SyncState { account: Some(account.clone()), ..Default::default() };
+        let mut local = vec![acc("GitHub")];
+        run(&t, &mut state, &key, &mut local);
+        let old = t.syncs.borrow()[&account.id].0.clone();
+        local.push(acc("Bank"));
+        run(&t, &mut state, &key, &mut local);
+        assert_eq!(state.seq, 2);
+
+        // The service (or someone between) hands back the first copy.
+        t.put_raw(&account.id, old);
+        assert_eq!(sync(&t, &state, &key, &local).err().as_deref(), Some(ROLLED_BACK));
+        assert_eq!(issuers(&local), ["GitHub", "Bank"]);
+    }
+
+    #[test]
+    fn wiping_stops_other_devices_without_deleting_there() {
+        let t = FakeService::default();
+        let mut account = create_account(&t, "https://sync.test").unwrap();
+        account.password = "pw".into();
+        let key = derive_key(&account);
+        let mut a_state = SyncState { account: Some(account.clone()), ..Default::default() };
+        let mut b_state = a_state.clone();
+        let (mut a, mut b) = (vec![acc("GitHub")], Vec::new());
+        run(&t, &mut a_state, &key, &mut a);
+        run(&t, &mut b_state, &key, &mut b);
+        assert_eq!(issuers(&b), ["GitHub"]);
+
+        wipe(&t, &a_state, &key).unwrap();
+        let tree: Json = serde_json::from_str(&decrypt(&key, &t.syncs.borrow()[&account.id].0).unwrap()).unwrap();
+        assert!(accounts_in(&tree).is_empty(), "gone from the service");
+        assert_eq!(sync(&t, &b_state, &key, &b).err().as_deref(), Some(WIPED));
+        assert_eq!(issuers(&b), ["GitHub"], "still on the other device");
+
+        // Set up again from scratch: it works, and the mark goes.
+        let mut c_state = SyncState { account: Some(account), ..Default::default() };
+        let mut c = vec![acc("Bank")];
+        run(&t, &mut c_state, &key, &mut c);
+        assert_eq!(issuers(&c), ["Bank"]);
+        assert!(sync(&t, &c_state, &key, &c).is_ok());
+    }
+
+    #[test]
+    fn data_is_padded_to_4_kib_steps() {
+        let t = FakeService::default();
+        let mut account = create_account(&t, "https://sync.test").unwrap();
+        account.password = "pw".into();
+        let key = derive_key(&account);
+        let mut state = SyncState { account: Some(account.clone()), ..Default::default() };
+        let mut local = Vec::new();
+        for n in 0..40 {
+            local.push(acc(&format!("Site {n}")));
+            run(&t, &mut state, &key, &mut local);
+            let text = decrypt(&key, &t.syncs.borrow()[&account.id].0).unwrap();
+            assert_eq!(text.len() % PAD_TO, 0, "{} accounts: {} bytes", n + 1, text.len());
+            assert_eq!(accounts_in(&serde_json::from_str(&text).unwrap()).len(), n + 1);
+        }
+    }
+
+    #[test]
     fn conflict_pulls_and_merges_again() {
         let t = FakeService::default();
         let mut account = create_account(&t, "https://sync.test").unwrap();
@@ -660,6 +853,16 @@ mod tests {
         // "abcabc": literal "abc" + 2-byte reference (length 3, distance 3).
         assert_eq!(lzutf8_decompress(&[b'a', b'b', b'c', 0b1100_0011, 3]), b"abcabc");
         assert_eq!(lzutf8_decompress(&[b'w', b'x', b'y', b'z', 0b1110_0010, 0, 4]), b"wxyzwx");
+    }
+
+    #[test]
+    fn proxies() {
+        assert_eq!(check_proxy("").unwrap(), "");
+        assert_eq!(check_proxy(" socks5h://127.0.0.1:9050/ ").unwrap(), TOR_PROXY);
+        assert_eq!(check_proxy("socks5://[::1]:9150").unwrap(), "socks5://[::1]:9150");
+        for bad in ["http://proxy:8080", "socks5://host", "socks5://:9050", "socks5://h:0", "socks5://a b:1", "127.0.0.1:9050"] {
+            assert!(check_proxy(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
