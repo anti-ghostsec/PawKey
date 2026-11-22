@@ -630,12 +630,13 @@ dependencies = [
 
 [[package]]
 name = "pawkey-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "argon2",
  "base64",
  "hmac",
+ "libc",
  "pbkdf2",
  "rqrr",
  "serde",
@@ -648,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "pawkey-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pawkey-core",
  "serde_json",

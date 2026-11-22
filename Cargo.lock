@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "pawkey"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gtk4",
  "pawkey-core",
@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "pawkey-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "argon2",

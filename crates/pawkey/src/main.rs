@@ -411,7 +411,7 @@ impl App {
         list.add_css_class("frame");
         let scroller = gtk::ScrolledWindow::builder().vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).child(&list).build();
         let empty = gtk::Label::builder()
-            .label("No accounts yet.\n\nClick + to add one from its setup QR code\n(a screenshot of it will do) or its secret key,\nor drop a picture of the QR code here.")
+            .label("No accounts yet.\n\nClick + to add one from its secret key\nor setup QR code (a screenshot copied to the\nclipboard: no need to save it), or drop a picture\nof the QR code here.")
             .justify(gtk::Justification::Center)
             .vexpand(true)
             .build();
@@ -1019,7 +1019,7 @@ impl App {
                 match cb.read_texture_future().await {
                     Ok(Some(t)) => ft(t),
                     _ => {
-                        show_error(&e2, "There's no picture on the clipboard. Take a screenshot of the QR code first (copy it, don't only save it).")
+                        show_error(&e2, "There's no picture on the clipboard. Copy a screenshot of the QR code first. There's no need to save it: a saved one keeps the secret, in your pictures and any cloud they go to.")
                     }
                 }
             });

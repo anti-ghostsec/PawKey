@@ -29,9 +29,12 @@ and a Kotlin app on Android, the way Wisp is built.
 - **Codes are made on this PC**, from each account's secret and the clock,
   as every authenticator app does. Nothing goes over the network unless
   you turn [sync](#sync) on.
-- **Setup QR codes** are read from a picture: a screenshot of the site's
-  setup page (copied, then *Paste a QR picture*), a saved image, or one
-  dropped on the window. Or paste the `otpauth://` link or the secret key.
+- **Setting up an account:** paste the site's secret key (most sites show
+  it under the QR code: "can't scan it?"), its `otpauth://` link, or a
+  picture of the QR code. For a picture, copy a screenshot to the clipboard
+  and click *Paste a QR picture*: don't save it. A saved screenshot keeps
+  the account's secret in your pictures folder, and in whatever cloud your
+  pictures go to. If you did save one, delete it once the account is added.
 
 ## Encryption
 
@@ -53,10 +56,24 @@ The sealing and the safe saving are `vaultkit`'s, from
 Changing a single byte of the file makes it fail to open, the same way a
 wrong password does.
 
-While PawKey is unlocked, the key and secrets are in memory; locking (the
-lock button, Ctrl+L, 5 minutes without use, or closing the window) wipes
-them. A copied code is cleared from the clipboard after 30 seconds, unless
-something else has been copied since.
+While PawKey is unlocked, the key and secrets are in memory. Locking wipes
+them, and closes any open dialog. It locks:
+
+- when you click the lock button or press Ctrl+L, or close the window;
+- after 5 minutes without use, counting time the computer spent asleep;
+- on Linux, just before the computer suspends, and when the session locks
+  or the screensaver starts;
+- on any computer, as soon as it wakes from sleep;
+- on Android, as soon as the screen turns off, and after 5 minutes without
+  use or in the background.
+
+The keyfiles chosen go too: they're picked again to unlock. A copied code
+is cleared from the clipboard after 30 seconds (even if PawKey is closed
+in the meantime), unless something else has been copied since. It's marked
+as a secret for clipboard managers and history (KDE, Windows' clipboard
+history and cloud clipboard, macOS); ones that ignore the mark may still
+keep it. PawKey's memory isn't written to crash dumps (Linux, macOS,
+Android), and keyboards are asked not to learn what's typed into it.
 
 ### Keyfiles
 
@@ -86,8 +103,9 @@ service only stores a blob of random-looking bytes and a date.
   in the same place as your passwords does mean one sync password opens
   both factors, so a sync ID of its own is the safer choice.
 - **When:** on unlocking, after adding or deleting an account, when the
-  sync button in the toolbar is clicked, and once a minute while unlocked
-  (a tiny "has it changed?" request unless something changed here).
+  sync button in the toolbar is clicked, and every 45 seconds to 2 minutes
+  while unlocked, at random (a tiny "has it changed?" request unless
+  something changed here).
 - **Two computers at once:** accounts are told apart by a random id each
   has, and merged three ways (what's here, what's on the service, and what
   was there last time), so an account added on one computer and another
@@ -98,6 +116,26 @@ service only stores a blob of random-looking bytes and a date.
   maintenance page, a Wi-Fi login page) stops the sync with nothing
   changed. If the service has no data at all for the sync ID, PawKey
   uploads its accounts again instead of taking that as them all deleted.
+  Redirects aren't followed, and the service's own error messages aren't
+  shown, only what the status means.
+- **Old copies:** every upload raises a counter inside the encrypted data,
+  and a device refuses data with a lower counter than it has seen. So an
+  old copy played back by the service (or by someone between) can't undo
+  what's been added or deleted since.
+- **Size:** the data is padded to 4 KiB steps, so its size doesn't say how
+  many accounts there are.
+- **Through Tor or a proxy:** the Sync box takes a SOCKS5 proxy,
+  `socks5://127.0.0.1:9050` for Tor (Orbot on Android). Names are looked up
+  through the proxy too. Without one, sync uses the system's proxy
+  settings, which is usually a direct connection. A `.onion` sync service
+  works through Tor.
+- **If the sync login may be in other hands** (a lost phone, say):
+  *Turn off sync… → Turn off and remove them from the service* takes
+  PawKey's accounts off the service (anything else stored with that sync
+  ID stays). Your other devices then stop syncing and keep their accounts.
+  Then make a new sync ID and set it up on each device. xBrowserSync has no
+  way to change a sync ID's password or delete it, so a new ID is how a
+  login is replaced.
 
 The format is Wisp's, which is xBrowserSync's own (v1.5+):
 
@@ -113,16 +151,17 @@ password. The sync password is all that protects the copy on the
 service, and anyone with that copy can try passwords at PBKDF2's speed
 (much faster than Argon2id), which is why PawKey makes a long random one.
 Typing your own instead, make it as long. *Turn off sync…* forgets it on
-this computer; the accounts stay here and on the service.
+this computer; the accounts stay here, and on the service unless you
+choose to remove them.
 
 ## Using it
 
 1. **The first time:** type a password twice (and add any keyfiles), then
    *Create vault*.
 2. **Add an account** (+ or Ctrl+N): on the site, turn on two-factor with
-   an authenticator app. Take a screenshot of its QR code and click
-   *Paste a QR picture*, or paste its setup key. Then type the code PawKey
-   shows into the site, to finish.
+   an authenticator app. Paste its setup key, or copy a screenshot of its
+   QR code to the clipboard (don't save it) and click *Paste a QR picture*.
+   Then type the code PawKey shows into the site, to finish.
 3. **Click an account** to copy its code. The seconds left show next to
    it, and it turns red for the last five.
 
@@ -170,12 +209,18 @@ The same vault format, codes and sync as the desktop, in an app of its own:
   an app in the background look at the clipboard, so if you copy
   something else in another app within those 30 seconds, that's cleared
   too.
-- Locks after 5 minutes without use, or 5 minutes in the background.
-  Screenshots and screen recording of PawKey are blocked, its pop-ups and
-  the camera scanner included.
+- Locks as soon as the screen turns off, and after 5 minutes without use
+  or in the background; open pop-ups close with it. Screenshots and screen
+  recording of PawKey are blocked, its pop-ups and the camera scanner
+  included. Keyboards are asked not to learn what's typed, and autofill
+  services are kept out.
+- A tapped `otpauth://` link is passed to PawKey in memory, so Android
+  doesn't keep it (secret included) with its list of recent apps. The
+  browser's history may still have it: clear it there.
+- At least 10 characters for the password (there are no keyfiles on
+  Android to add strength).
 - To have the same accounts as your computer, turn sync on in one of them
   and type its sync ID and password into the other (☰ → *Sync…*).
-- No keyfiles on Android yet: a vault there is opened with its password.
 
 ## What it doesn't do yet
 
@@ -199,6 +244,26 @@ The same vault format, codes and sync as the desktop, in an app of its own:
   password box, which PawKey can't wipe; nothing keeps secrets out of swap.
 - Rolling the whole vault file back to an older copy of itself isn't
   detected.
+- Old copies of the vault aren't wiped from the disk: saving writes a new
+  file and renames it over the old one, and *Reset* overwrites the file
+  before removing it, but SSDs and some file systems keep old blocks
+  around anyway. An old copy opens only with the password (and keyfiles)
+  it had then, so after a password change, an old copy still opens with
+  the old password.
+- Someone watching the network can tell when PawKey is unlocked with sync
+  on (it checks every minute or two), though not what changed. Padding and
+  random timing hide how many accounts there are and the rhythm, not that.
+- The sync service's certificate isn't pinned: the system's certificate
+  authorities are trusted. Everything sent is end-to-end encrypted anyway;
+  a fake service could only withhold data or play back old copies, which
+  PawKey refuses.
+- PawKey doesn't hide what it is: its name and icon show in the app list,
+  and its files are named after it.
+- Downloads can be checked through GitHub's signed build provenance
+  (below) and the APK's signing key, not a signature of PawKey's own:
+  the Windows build isn't Authenticode-signed, the macOS one isn't
+  notarized, and the Linux one has no separate signature.
+- No keyfiles on Android yet.
 
 ## Building
 
@@ -218,6 +283,18 @@ verify FILE --repo anti-ghostsec/PawKey`). The Android APKs are signed with
 PawKey's own key (GitHub secrets `ANDROID_KEYSTORE` and
 `ANDROID_KEYSTORE_PASSWORD`, checked against `android/release-cert.sha256`);
 without the key, the release ships without them.
+
+The release workflow keeps that key away from build code. The jobs that
+build (running Gradle plugins, Rust build scripts and cargo-ndk) get no
+secrets and a read-only token. A separate job, on a fresh runner, signs
+the APKs with the runner image's own `apksigner` and runs nothing from the
+build, and only the publishing job can write to the release. The Gradle
+download is pinned by its checksum (`distributionSha256Sum`), and every
+plugin and library Gradle fetches is checked against
+`android/gradle/verification-metadata.xml`. After changing a Gradle
+dependency, regenerate that file and look over what changed:
+`./gradlew --write-verification-metadata sha256 assembleRelease assembleDebug`
+in `android/`.
 
 | Part | What it is |
 |---|---|

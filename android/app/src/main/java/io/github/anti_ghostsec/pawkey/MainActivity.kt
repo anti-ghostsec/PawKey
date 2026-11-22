@@ -3,6 +3,9 @@ package io.github.anti_ghostsec.pawkey
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.IntentFilter
+import android.content.BroadcastReceiver
+import android.app.Dialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -54,9 +57,12 @@ import uniffi.pawkey_ffi.SyncLogin
 import uniffi.pawkey_ffi.createVault
 import uniffi.pawkey_ffi.defaultSyncService
 import uniffi.pawkey_ffi.destroyVault
+import uniffi.pawkey_ffi.harden
 import uniffi.pawkey_ffi.openVault
 import uniffi.pawkey_ffi.parseLink
+import uniffi.pawkey_ffi.passwordProblem
 import uniffi.pawkey_ffi.readQr
+import uniffi.pawkey_ffi.torProxy
 import uniffi.pawkey_ffi.vaultExists
 
 /** Dark is the default, as on the desktop. */
@@ -72,12 +78,16 @@ class Palette(dark: Boolean) {
 class MainActivity : Activity() {
     companion object {
         const val AUTO_LOCK_MS = 5 * 60 * 1000L
-        const val SYNC_EVERY_MS = 60_000L
+        /** A random time between sync checks, 45 s to 2 min: no steady beat to spot. */
+        fun nextSyncCheck() = 45_000L + java.security.SecureRandom().nextInt(75_000)
         const val REQ_CAMERA = 1
         const val REQ_PICTURE = 2
 
         // Kept across the activity being remade (the theme switch); wiped on lock.
         private var session: Session? = null
+
+        /** A tapped otpauth:// link, from [LinkActivity]: in memory only, never in an Intent. */
+        @Volatile internal var incomingLink: String? = null
     }
 
     private val work = Executors.newSingleThreadExecutor()
@@ -106,6 +116,16 @@ class MainActivity : Activity() {
     private var syncing = false
     private var syncAgain: Boolean? = null
     private var lastSync = 0L
+    private var syncEvery = nextSyncCheck()
+
+    // Open pop-ups and the scanner: closed when PawKey locks.
+    private val dialogs = mutableListOf<Dialog>()
+    private var scanner: QrScanner? = null
+    private val screenOff = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (session != null) lock()
+        }
+    }
     private var syncStatus = ""
     private var statusLabel: TextView? = null
 
@@ -118,7 +138,10 @@ class MainActivity : Activity() {
         val dark = prefs.getBoolean("dark", true)
         setTheme(if (dark) android.R.style.Theme_Material_NoActionBar else android.R.style.Theme_Material_Light_NoActionBar)
         super.onCreate(state)
+        harden()
         p = Palette(dark)
+        // Screen off: locked at once, so a phone taken from you isn't open.
+        registerReceiver(screenOff, IntentFilter(Intent.ACTION_SCREEN_OFF))
         guard(window)
         @Suppress("DEPRECATION")
         window.statusBarColor = p.bg
@@ -135,8 +158,9 @@ class MainActivity : Activity() {
         if (session != null) pendingLink?.let { pendingLink = null; addDialog(it) }
     }
 
-    private fun takeLink(intent: Intent?) {
-        val uri = intent?.data?.toString() ?: return
+    private fun takeLink(@Suppress("UNUSED_PARAMETER") intent: Intent?) {
+        val uri = incomingLink ?: return
+        incomingLink = null
         if (uri.startsWith("otpauth://")) {
             pendingLink = uri
             if (session == null) toast("Unlock PawKey to add the account.")
@@ -160,6 +184,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(screenOff) } catch (_: Exception) {}
         ui.removeCallbacksAndMessages(null)
         if (isFinishing) wipe()
         work.shutdown()
@@ -174,7 +199,7 @@ class MainActivity : Activity() {
                 if (t - lastActive > AUTO_LOCK_MS) lock()
                 else {
                     updateCodes()
-                    if (!syncing && lastSync > 0 && t - lastSync > SYNC_EVERY_MS) syncSoon(false)
+                    if (!syncing && lastSync > 0 && t - lastSync > syncEvery) syncSoon(false)
                 }
             }
             ui.postDelayed(this, 500)
@@ -199,6 +224,9 @@ class MainActivity : Activity() {
         else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         // A password field's hint would otherwise be in a monospace font.
         typeface = Typeface.DEFAULT
+        // Keyboards mustn't learn (or upload) what's typed, nor autofill services see it.
+        imeOptions = imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
     }
 
     private fun button(s: String, primary: Boolean = false, danger: Boolean = false) = Button(this).apply {
@@ -244,7 +272,14 @@ class MainActivity : Activity() {
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) w?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
 
-    private fun AlertDialog.Builder.open(): AlertDialog = create().also { guard(it.window); it.show() }
+    /** A pop-up: no screenshots, and closed when PawKey locks. */
+    private fun guard(d: Dialog) {
+        guard(d.window)
+        dialogs.removeAll { !it.isShowing }
+        dialogs.add(d)
+    }
+
+    private fun AlertDialog.Builder.open(): AlertDialog = create().also { guard(it as Dialog); it.show() }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
@@ -299,7 +334,7 @@ class MainActivity : Activity() {
 
         go.setOnClickListener {
             val pw = pw1.text.toString()
-            if (creating && pw.isEmpty()) return@setOnClickListener err.show("Pick a password (a long one).")
+            if (creating) passwordProblem(pw)?.let { return@setOnClickListener err.show(it) }
             if (creating && pw != pw2.text.toString()) return@setOnClickListener err.show("The two passwords don't match.")
             err.show("")
             go.isEnabled = false
@@ -339,6 +374,10 @@ class MainActivity : Activity() {
     }
 
     private fun lock() {
+        dialogs.forEach { try { it.dismiss() } catch (_: Exception) {} }
+        dialogs.clear()
+        scanner?.close()
+        scanner = null
         wipe()
         rows.clear()
         showLock()
@@ -363,7 +402,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        guard(d.window)
+        guard(d as Dialog)
         d.show()
     }
 
@@ -475,7 +514,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Delete") { _, _ ->
                 val s = session ?: return@setPositiveButton
                 bg({ s.delete(a.uid) }) { r ->
-                    r.onSuccess { renderList(); toast("Deleted $title."); syncSoon(false) }.onFailure { toast(message(it)) }
+                    r.onSuccess { renderList(); toast("Deleted."); syncSoon(false) }.onFailure { toast(message(it)) }
                 }
             }
             .open()
@@ -538,11 +577,11 @@ class MainActivity : Activity() {
         val gotLink = { uri: String -> link.setText(uri) }
         scan.setOnClickListener {
             withCamera {
-                QrScanner(this) { found ->
+                scanner = QrScanner(this) { found ->
                     setupLink(found).onSuccess(gotLink).isSuccess.also { ok ->
                         if (!ok && found.any { it.startsWith("otpauth-migration://") }) toast(setupLink(found).exceptionOrNull()?.message ?: "")
                     }
-                }.show()
+                }.also { it.show() }
             }
         }
         picture.setOnClickListener {
@@ -564,11 +603,11 @@ class MainActivity : Activity() {
                     if (t.startsWith("otpauth")) s.addLink(t, iss, nm)
                     else s.addSecret(t, iss, nm, (6 + digits.selectedItemPosition).toUInt(), secs, algorithm)
                 }) { r ->
-                    r.onSuccess { d.dismiss(); renderList(); toast("Added ${it.title}."); syncSoon(false) }.onFailure { err.show(message(it)) }
+                    r.onSuccess { d.dismiss(); renderList(); toast("Added."); syncSoon(false) }.onFailure { err.show(message(it)) }
                 }
             }
         }
-        guard(d.window)
+        guard(d as Dialog)
         d.show()
         prefill?.let { link.setText(it) }
     }
@@ -666,7 +705,7 @@ class MainActivity : Activity() {
             val ok = d.getButton(AlertDialog.BUTTON_POSITIVE)
             ok.setOnClickListener {
                 val pw = pw1.text.toString()
-                if (pw.isEmpty()) return@setOnClickListener err.show("Pick a password.")
+                passwordProblem(pw)?.let { return@setOnClickListener err.show(it) }
                 if (pw != pw2.text.toString()) return@setOnClickListener err.show("The two passwords don't match.")
                 ok.isEnabled = false
                 bg({ s.changePassword(pw) }) { r ->
@@ -675,7 +714,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        guard(d.window)
+        guard(d as Dialog)
         d.show()
     }
 
@@ -698,6 +737,7 @@ class MainActivity : Activity() {
         if (syncing) { syncAgain = force || syncAgain == true; return }
         syncing = true
         lastSync = SystemClock.elapsedRealtime()
+        syncEvery = nextSyncCheck()
         refreshSyncButton()
         net.execute {
             val r = runCatching { s.sync(http, force) }
@@ -720,7 +760,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Done", null).create()
         val login = s.syncLogin()
         if (login == null) syncOffPage(v, d, s) else syncOnPage(v, d, s, login)
-        guard(d.window)
+        guard(d as Dialog)
         d.show()
     }
 
@@ -730,6 +770,9 @@ class MainActivity : Activity() {
         v.add(text("Service", 13f, p.dim), 12)
         val service = edit("https://…").apply { setText(defaultSyncService()) }
         v.add(service, 0)
+        v.add(text("Proxy (optional)", 13f, p.dim), 12)
+        val proxy = edit("None, or ${torProxy()} for Tor (Orbot)")
+        v.add(proxy, 0)
         val create = button("Make a new sync ID", primary = true)
         v.add(create)
         v.add(text("Or use a sync ID you already have, from another PawKey (or Wisp's):", 15f), 20)
@@ -759,11 +802,15 @@ class MainActivity : Activity() {
                 }
             }
         }
-        create.setOnClickListener { val svc = service.text.toString(); run { s.syncCreate(svc, http) } }
+        create.setOnClickListener {
+            val (svc, px) = service.text.toString() to proxy.text.toString()
+            run { s.syncCreate(svc, px, http) }
+        }
         connect.setOnClickListener {
             val login = SyncLogin(service.text.toString(), id.text.toString().trim(), pw.text.toString())
             if (login.id.isEmpty() || login.password.isEmpty()) return@setOnClickListener err.show("Type the sync ID and its password.")
-            run { s.syncConnect(login, http) }
+            val px = proxy.text.toString()
+            run { s.syncConnect(login, px, http) }
         }
     }
 
@@ -792,6 +839,19 @@ class MainActivity : Activity() {
         field("Service", login.service, false)
         field("Sync ID", login.id, false)
         field("Password", login.password, true)
+        v.add(text("Proxy", 13f, p.dim), 14)
+        val proxyRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val proxy = edit("None, or ${torProxy()} for Tor (Orbot)").apply { setText(s.syncProxy()) }
+        proxyRow.addView(proxy, LinearLayout.LayoutParams(0, -2, 1f))
+        proxyRow.addView(text("Use", 14f, p.accent).apply {
+            setPadding(px(12), px(8), px(12), px(8))
+            setOnClickListener {
+                runCatching { s.setSyncProxy(proxy.text.toString()) }
+                    .onSuccess { kept -> proxy.setText(kept); toast(if (kept.isEmpty()) "Sync uses the system's settings." else "Sync goes through the proxy."); syncSoon(true) }
+                    .onFailure { toast(message(it)) }
+            }
+        })
+        v.add(proxyRow, 0)
         v.add(text("To add another device: open PawKey there, then Sync… → use a sync ID you already have, and type these two. " +
             "Keep the password to yourself: with the sync ID, it opens your accounts.", 14f, p.dim), 14)
         val now = button("Sync now")
@@ -802,8 +862,15 @@ class MainActivity : Activity() {
         off.setOnClickListener {
             AlertDialog.Builder(this)
                 .setTitle("Turn off sync on this device?")
-                .setMessage("Your accounts stay here, and on the service for your other devices. To sync again, use the same sync ID and password: copy them first if you haven't kept them.")
+                .setMessage("Your accounts stay here. On the service they can stay for your other devices, or be removed: then nobody " +
+                    "with the sync password can get them from there, and your other devices stop syncing (keeping their accounts).")
                 .setNegativeButton("Cancel", null)
+                .setNeutralButton("Turn off and remove") { _, _ ->
+                    bg({ s.syncWipe(http); s.syncOff() }) { r ->
+                        r.onSuccess { d.dismiss(); setSyncStatus(""); toast("Sync is off, and PawKey's accounts are off the service.") }
+                            .onFailure { toast("Couldn't remove them from the service, so sync is still on: ${message(it)}") }
+                    }
+                }
                 .setPositiveButton("Turn off") { _, _ ->
                     bg({ s.syncOff() }) { r ->
                         r.onSuccess { d.dismiss(); setSyncStatus(""); toast("Sync is off.") }.onFailure { toast(message(it)) }

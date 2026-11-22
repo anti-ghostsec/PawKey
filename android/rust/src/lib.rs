@@ -10,10 +10,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use pawkey_core::qr;
 use pawkey_core::sync::{self, SyncAccount, SyncState, Transport};
 use pawkey_core::totp::{self, Account, Algo};
 use pawkey_core::vault::{self, Vault};
-use pawkey_core::qr;
 use serde_json::Value as Json;
 
 uniffi::setup_scaffolding!();
@@ -22,7 +22,9 @@ uniffi::setup_scaffolding!();
 pub enum PawError {
     /// Wrong password, or not a PawKey vault (they can't be told apart).
     WrongPassword,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 impl fmt::Display for PawError {
@@ -62,7 +64,14 @@ pub struct AccountView {
 
 impl From<&Account> for AccountView {
     fn from(a: &Account) -> Self {
-        AccountView { uid: a.uid.clone(), issuer: a.issuer.clone(), name: a.name.clone(), title: a.title().to_string(), digits: a.digits, period: a.period }
+        AccountView {
+            uid: a.uid.clone(),
+            issuer: a.issuer.clone(),
+            name: a.name.clone(),
+            title: a.title().to_string(),
+            digits: a.digits,
+            period: a.period,
+        }
     }
 }
 
@@ -93,31 +102,48 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// Android's HTTPS, from Kotlin. `body` is sent as `application/json`.
+/// Android's HTTPS, from Kotlin. `body` is sent as `application/json`;
+/// `proxy` is empty (the system's settings) or a checked `socks5://host:port`.
 #[uniffi::export(with_foreign)]
 pub trait HttpClient: Send + Sync {
-    fn request(&self, method: String, url: String, body: Option<String>) -> HttpResponse;
+    fn request(&self, method: String, url: String, body: Option<String>, proxy: String) -> HttpResponse;
 }
 
-struct Http(Arc<dyn HttpClient>);
+struct Http(Arc<dyn HttpClient>, String);
 
 impl Transport for Http {
     fn request(&self, method: &str, url: &str, body: Option<&Json>) -> Result<Json, String> {
         if !sync::service_is_private(url) {
             return Err("The sync service's address must start with https://.".into());
         }
-        let r = self.0.request(method.to_string(), url.to_string(), body.map(|b| b.to_string()));
+        let r = self.0.request(method.to_string(), url.to_string(), body.map(|b| b.to_string()), self.1.clone());
         if r.status == 0 {
             return Err(format!("Can't reach the sync service: {}", r.body));
         }
-        let parsed: Result<Json, _> = serde_json::from_str(&r.body);
         if !(200..300).contains(&r.status) {
-            let msg = parsed.ok().and_then(|j| j["message"].as_str().map(str::to_string));
-            return Err(format!("{} {}", r.status, msg.as_deref().unwrap_or("request failed")));
+            return Err(sync::http_error(r.status));
         }
+        let parsed: Result<Json, _> = serde_json::from_str(&r.body);
         // A web page instead of JSON (a captive portal, maintenance): an error.
         parsed.map_err(|_| sync::NOT_SYNC_DATA.to_string())
     }
+}
+
+/// No core dumps, not debuggable by other apps: called when the app starts.
+#[uniffi::export]
+pub fn harden() {
+    pawkey_core::harden_process();
+}
+
+/// Why a new password won't do (too short), if it won't.
+#[uniffi::export]
+pub fn password_problem(password: String) -> Option<String> {
+    vault::password_problem(&zeroize::Zeroizing::new(password), false)
+}
+
+#[uniffi::export]
+pub fn tor_proxy() -> String {
+    sync::TOR_PROXY.to_string()
 }
 
 #[uniffi::export]
@@ -128,6 +154,9 @@ pub fn vault_exists(path: String) -> bool {
 #[uniffi::export]
 pub fn create_vault(path: String, password: String) -> Result<Arc<Session>, PawError> {
     let password = zeroize::Zeroizing::new(password);
+    if let Some(e) = vault::password_problem(&password, false) {
+        return Err(failed(e));
+    }
     Ok(Session::new(Vault::create(&PathBuf::from(path), password.as_bytes(), None)?))
 }
 
@@ -210,9 +239,9 @@ impl Session {
         self.sync_key.lock().ok()?.as_ref().filter(|(a, _)| a == account).map(|(_, k)| k.clone())
     }
 
-    fn turn_on(&self, account: SyncAccount, key: sync::Key) -> Result<(), PawError> {
+    fn turn_on(&self, account: SyncAccount, key: sync::Key, proxy: String) -> Result<(), PawError> {
         self.change(|v| {
-            v.sync = SyncState { account: Some(account.clone()), base: Vec::new(), last_updated: String::new() };
+            v.sync = SyncState { account: Some(account.clone()), proxy, ..Default::default() };
             Ok(())
         })?;
         *self.sync_key.lock().unwrap() = Some((account, key));
@@ -242,7 +271,15 @@ impl Session {
     }
 
     /// `algorithm`: SHA1, SHA256 or SHA512.
-    pub fn add_secret(&self, secret: String, issuer: String, name: String, digits: u32, period: u64, algorithm: String) -> Result<AccountView, PawError> {
+    pub fn add_secret(
+        &self,
+        secret: String,
+        issuer: String,
+        name: String,
+        digits: u32,
+        period: u64,
+        algorithm: String,
+    ) -> Result<AccountView, PawError> {
         let mut acc = Account::new("", "", &secret).map_err(failed)?;
         if !(6..=8).contains(&digits) || period == 0 {
             return Err(failed("Digits must be 6 to 8, and the period above zero."));
@@ -262,6 +299,9 @@ impl Session {
 
     pub fn change_password(&self, password: String) -> Result<(), PawError> {
         let password = zeroize::Zeroizing::new(password);
+        if let Some(e) = vault::password_problem(&password, false) {
+            return Err(failed(e));
+        }
         self.vault().change_password(password.as_bytes(), None).map_err(PawError::from)
     }
 
@@ -269,20 +309,47 @@ impl Session {
         self.vault().sync.account.as_ref().map(SyncLogin::from)
     }
 
+    /// The sync proxy: empty, or `socks5://host:port`.
+    pub fn sync_proxy(&self) -> String {
+        self.vault().sync.proxy.clone()
+    }
+
+    /// Checks and keeps a new sync proxy; returns it as kept.
+    pub fn set_sync_proxy(&self, proxy: String) -> Result<String, PawError> {
+        let proxy = sync::check_proxy(&proxy).map_err(failed)?;
+        self.change(|v| {
+            v.sync.proxy = proxy.clone();
+            Ok(())
+        })?;
+        Ok(proxy)
+    }
+
     /// A new sync ID on `service`, with a random password; syncs next.
-    pub fn sync_create(&self, service: String, http: Arc<dyn HttpClient>) -> Result<SyncLogin, PawError> {
-        let account = sync::create_account(&Http(http), &service).map_err(failed)?;
+    pub fn sync_create(&self, service: String, proxy: String, http: Arc<dyn HttpClient>) -> Result<SyncLogin, PawError> {
+        let proxy = sync::check_proxy(&proxy).map_err(failed)?;
+        let account = sync::create_account(&Http(http, proxy.clone()), &service).map_err(failed)?;
         let key = sync::derive_key(&account);
         let login = SyncLogin::from(&account);
-        self.turn_on(account, key)?;
+        self.turn_on(account, key, proxy)?;
         Ok(login)
     }
 
     /// Uses an existing sync ID (another PawKey's, or Wisp's).
-    pub fn sync_connect(&self, login: SyncLogin, http: Arc<dyn HttpClient>) -> Result<(), PawError> {
+    pub fn sync_connect(&self, login: SyncLogin, proxy: String, http: Arc<dyn HttpClient>) -> Result<(), PawError> {
+        let proxy = sync::check_proxy(&proxy).map_err(failed)?;
         let wanted = SyncAccount { service: login.service, id: login.id, password: login.password };
-        let (account, key) = sync::connect(&Http(http), &wanted).map_err(failed)?;
-        self.turn_on(account, key)
+        let (account, key) = sync::connect(&Http(http, proxy.clone()), &wanted).map_err(failed)?;
+        self.turn_on(account, key, proxy)
+    }
+
+    /// Takes PawKey's accounts off the service (for a sync login that may
+    /// be in other hands); other devices then stop syncing, keeping theirs.
+    pub fn sync_wipe(&self, http: Arc<dyn HttpClient>) -> Result<(), PawError> {
+        let _one = self.syncing.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.vault().sync.clone();
+        let account = state.account.clone().ok_or_else(|| failed("Sync is off."))?;
+        let key = self.key_for(&account).unwrap_or_else(|| sync::derive_key(&account));
+        sync::wipe(&Http(http, state.proxy.clone()), &state, &key).map_err(failed)
     }
 
     /// Forgets the sync login here; the accounts stay.
@@ -305,9 +372,9 @@ impl Session {
         };
         let Some(account) = state.account.clone() else { return Ok(false) };
         let key = self.key_for(&account).unwrap_or_else(|| sync::derive_key(&account));
-        let t = Http(http);
-        let dirty = local.iter().map(|a| a.uid.as_str()).collect::<std::collections::BTreeSet<_>>()
-            != state.base.iter().map(String::as_str).collect();
+        let t = Http(http, state.proxy.clone());
+        let dirty =
+            local.iter().map(|a| a.uid.as_str()).collect::<std::collections::BTreeSet<_>>() != state.base.iter().map(String::as_str).collect();
         if !force && !dirty && !sync::remote_changed(&t, &state).map_err(failed)? {
             *self.sync_key.lock().unwrap() = Some((account, key));
             return Ok(false);
@@ -324,6 +391,7 @@ impl Session {
             v.accounts = merged;
             v.sync.base = out.base;
             v.sync.last_updated = out.last_updated;
+            v.sync.seq = out.seq;
             Ok(changed)
         })
     }
